@@ -17,13 +17,30 @@ pub enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// Manage optional platform scheduling for Lop runs.
+    Schedule {
+        #[command(subcommand)]
+        command: ScheduleCommand,
+    },
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Subcommand)]
+pub enum ScheduleCommand {
+    /// Install or refresh the platform schedule.
+    Install,
+    /// Report whether the platform schedule is installed and loaded.
+    Status,
+    /// Edit validated settings, then regenerate and reload the schedule.
+    Edit,
+    /// Stop and remove the platform schedule.
+    Uninstall,
 }
 
 #[cfg(test)]
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Command};
+    use super::{Cli, Command, ScheduleCommand};
 
     #[test]
     fn parses_scan() {
@@ -54,5 +71,22 @@ mod tests {
     #[test]
     fn rejects_yes_for_scan() {
         assert!(Cli::try_parse_from(["lop", "scan", "--yes"]).is_err());
+    }
+
+    #[test]
+    fn parses_schedule_commands() {
+        for (name, expected) in [
+            ("install", ScheduleCommand::Install),
+            ("status", ScheduleCommand::Status),
+            ("edit", ScheduleCommand::Edit),
+            ("uninstall", ScheduleCommand::Uninstall),
+        ] {
+            assert_eq!(
+                Cli::try_parse_from(["lop", "schedule", name])
+                    .unwrap()
+                    .command,
+                Command::Schedule { command: expected }
+            );
+        }
     }
 }

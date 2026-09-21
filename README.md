@@ -14,8 +14,8 @@ lop prune --yes
 ```
 
 `scan` reports what Lop would do. `prune` runs the same pipeline and remains a
-dry run unless `--yes` is present. Scheduler and Herdr integrations are
-optional; neither is required by the CLI.
+dry run unless `--yes` is present. Scheduler and Herdr integrations are optional; neither is required for manual
+cleanup runs.
 
 Lop emits newline-delimited JSON records. Every record includes a schema
 version, and repository/worktree records use stable reason codes. A run returns
@@ -65,8 +65,51 @@ completed Git removal.
 Lop runs a foreground, confirmed Worktrunk removal without force, force-delete,
 or process-reaping flags, and reports Worktrunk's branch-deletion outcome.
 
-Scheduling support will target macOS LaunchAgents first while remaining
-separate from the normal CLI.
+## Scheduling
+
+macOS scheduling is optional and remains separate from `scan` and `prune`:
+
+```console
+lop schedule install
+lop schedule status
+lop schedule edit
+lop schedule uninstall
+```
+
+Installation starts in preview-only `scan` mode every 1,800 seconds. It creates
+`~/Library/LaunchAgents/org.nixos.lop.plist`, stores validated settings in
+`~/.config/lop/schedule.toml` (honoring `XDG_CONFIG_HOME`), and writes service
+output under `~/Library/Logs/org.nixos`. `schedule edit` opens a temporary copy
+with `VISUAL` or `EDITOR`; Lop accepts only `scan` or `prune` mode and intervals
+from 300 through 604,800 seconds before replacing and reloading the agent.
+`prune` mode always invokes `lop prune --yes` explicitly.
+
+The generated LaunchAgent runs at load without `KeepAlive`, uses an explicit
+PATH containing Lop, Git, and Worktrunk, disables terminal credential prompts,
+and carries a validated `SSH_AUTH_SOCK` when present. Installation performs a
+noninteractive dry-run fetch against every discovered repository before loading
+the agent. This catches missing credentials in the launchd environment rather
+than relying on an interactive shell. Lop's process-wide lock prevents overlap.
+Install and uninstall are safe to repeat; uninstall removes the LaunchAgent and
+schedule settings while retaining logs. Other platforms return a scheduling-
+unavailable error without changing manual command behavior.
+
+## Declarative package
+
+The flake exports `packages.<system>.lop` and `packages.<system>.default`. A
+`system-config` flake can package Lop declaratively by adding this repository as
+an input and including the package in Home Manager:
+
+```nix
+# flake inputs
+lop.url = "github:johnallen3d/lop";
+
+# Home Manager module arguments include `lop`
+home.packages = [lop.packages.${pkgs.system}.default];
+```
+
+Scheduling remains opt-in after package installation, so `lop scan` and
+`lop prune --yes` continue to work without a LaunchAgent.
 
 ## Development
 

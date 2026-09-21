@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>org.nixos.lop</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/nix/store/lop/bin/lop</string>
+        <string>scan</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>1800</integer>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>GIT_TERMINAL_PROMPT</key>
+        <string>0</string>
+        <key>GIT_SSH_COMMAND</key>
+        <string>/usr/bin/ssh -o BatchMode=yes</string>
+        <key>PATH</key>
+        <string>/bin:/nix/store/git/bin:/nix/store/lop/bin:/nix/store/worktrunk/bin:/usr/bin</string>
+        <key>SSH_AUTH_SOCK</key>
+        <string>/private/tmp/agent.sock</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/Users/test/Library/Logs/org.nixos/lop.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/test/Library/Logs/org.nixos/lop.err.log</string>
+</dict>
+</plist>

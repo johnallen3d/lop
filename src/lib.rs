@@ -8,6 +8,7 @@ pub mod integration;
 pub mod lock;
 pub mod output;
 pub mod paths;
+pub mod schedule;
 pub mod state;
 
 use std::{io::Write, time::Duration};
@@ -38,6 +39,8 @@ pub enum Error {
     State(#[from] state::StateError),
     #[error("failed to write structured output: {0}")]
     Output(#[from] std::io::Error),
+    #[error("schedule commands must be run through the scheduling interface")]
+    ScheduleCommand,
 }
 
 /// Runs Lop's operational shell. Repository discovery and classification plug into
@@ -70,6 +73,7 @@ pub fn run_with_paths(
     let (command, apply) = match &cli.command {
         Command::Scan => (CommandName::Scan, false),
         Command::Prune { yes } => (CommandName::Prune, *yes),
+        Command::Schedule { .. } => return Err(Error::ScheduleCommand),
     };
 
     write_event(

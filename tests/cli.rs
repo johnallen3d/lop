@@ -146,6 +146,42 @@ fn inaccessible_scan_root_is_an_operational_failure() {
     assert_eq!(records[2]["operational_failures"], 1);
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn absent_schedule_status_and_uninstall_are_idempotent() {
+    let directory = tempdir().unwrap();
+
+    for arguments in [
+        &["schedule", "status"][..],
+        &["schedule", "uninstall"][..],
+        &["schedule", "uninstall"][..],
+    ] {
+        let output = lop()
+            .args(arguments)
+            .env("HOME", directory.path())
+            .env_remove("XDG_CONFIG_HOME")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn scheduling_is_unavailable_without_affecting_cleanup_commands() {
+    let output = lop().args(["schedule", "status"]).output().unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("scan and prune remain available")
+    );
+}
+
 #[test]
 fn prune_requires_yes_to_apply() {
     let directory = tempdir().unwrap();
