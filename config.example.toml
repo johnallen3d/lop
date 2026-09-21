@@ -1,0 +1,12 @@
+# Directories containing main repositories. Lop never assumes where linked
+# worktrees live; it asks each repository through `git worktree list`.
+roots = ["~/dev/src"]
+
+# Maximum directory depth beneath each root when finding main repositories.
+scan_depth = 3
+
+# Maximum time allowed for each repository fetch.
+fetch_timeout_seconds = 60
+
+# Refuse cleanup when a process has its current directory in the worktree.
+check_processes = true

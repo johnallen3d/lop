@@ -1,0 +1,11 @@
+[package]
+name = "lop"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Conservative cleanup of stale Git worktrees"
+license = "MIT"
+repository = "https://github.com/johnallen3d/lop"
+publish = false
+
+[dependencies]
