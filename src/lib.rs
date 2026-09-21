@@ -2,6 +2,7 @@ pub mod cli;
 pub mod config;
 pub mod discovery;
 pub mod inspection;
+pub mod integration;
 pub mod lock;
 pub mod output;
 pub mod paths;
@@ -169,6 +170,10 @@ const fn repository_result(
         RepositoryInspectionOutcome::MalformedPorcelain => {
             (RepositoryOutcome::Malformed, ReasonCode::MalformedPorcelain)
         }
+        RepositoryInspectionOutcome::IntegrationFailed => (
+            RepositoryOutcome::IntegrationFailed,
+            ReasonCode::WorktrunkFailed,
+        ),
         RepositoryInspectionOutcome::InspectionFailed => {
             (RepositoryOutcome::Malformed, ReasonCode::InvalidGitMetadata)
         }
@@ -193,8 +198,40 @@ const fn worktree_result(classification: WorktreeClassification) -> (WorktreeOut
         WorktreeClassification::PrunableWorktree => {
             (WorktreeOutcome::Malformed, ReasonCode::PrunableWorktree)
         }
-        WorktreeClassification::UpstreamMissing => {
-            (WorktreeOutcome::Candidate, ReasonCode::UpstreamMissing)
+        WorktreeClassification::IntegratedSameCommit => {
+            (WorktreeOutcome::Candidate, ReasonCode::IntegratedSameCommit)
+        }
+        WorktreeClassification::IntegratedAncestor => {
+            (WorktreeOutcome::Candidate, ReasonCode::IntegratedAncestor)
+        }
+        WorktreeClassification::IntegratedNoAddedChanges => (
+            WorktreeOutcome::Candidate,
+            ReasonCode::IntegratedNoAddedChanges,
+        ),
+        WorktreeClassification::IntegratedTreesMatch => {
+            (WorktreeOutcome::Candidate, ReasonCode::IntegratedTreesMatch)
+        }
+        WorktreeClassification::IntegratedMergeAddsNothing => (
+            WorktreeOutcome::Candidate,
+            ReasonCode::IntegratedMergeAddsNothing,
+        ),
+        WorktreeClassification::IntegratedPatchIdMatch => (
+            WorktreeOutcome::Candidate,
+            ReasonCode::IntegratedPatchIdMatch,
+        ),
+        WorktreeClassification::NotIntegrated => {
+            (WorktreeOutcome::Retained, ReasonCode::NotIntegrated)
+        }
+        WorktreeClassification::IntegrationIndeterminate => (
+            WorktreeOutcome::Retained,
+            ReasonCode::IntegrationIndeterminate,
+        ),
+        WorktreeClassification::DefaultBranchUnresolved => (
+            WorktreeOutcome::Retained,
+            ReasonCode::DefaultBranchUnresolved,
+        ),
+        WorktreeClassification::WorktrunkFailed => {
+            (WorktreeOutcome::Retained, ReasonCode::WorktrunkFailed)
         }
         WorktreeClassification::FetchFailed => (WorktreeOutcome::Skipped, ReasonCode::FetchFailed),
         WorktreeClassification::FetchTimedOut => {

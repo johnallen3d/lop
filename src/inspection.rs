@@ -10,12 +10,17 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
 
+use crate::integration::{
+    IntegrationCandidate, IntegrationProof, IntegrationReason, prove_integrations,
+};
+
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum RepositoryInspectionOutcome {
     Inspected,
     FetchFailed,
     FetchTimedOut,
     MalformedPorcelain,
+    IntegrationFailed,
     InspectionFailed,
 }
 
@@ -27,7 +32,16 @@ pub enum WorktreeClassification {
     DetachedWorktree,
     DanglingSymbolicHead,
     PrunableWorktree,
-    UpstreamMissing,
+    IntegratedSameCommit,
+    IntegratedAncestor,
+    IntegratedNoAddedChanges,
+    IntegratedTreesMatch,
+    IntegratedMergeAddsNothing,
+    IntegratedPatchIdMatch,
+    NotIntegrated,
+    IntegrationIndeterminate,
+    DefaultBranchUnresolved,
+    WorktrunkFailed,
     FetchFailed,
     FetchTimedOut,
     Malformed,
@@ -153,6 +167,7 @@ fn classify_after_fetch(
     worktrees: Vec<PorcelainWorktree>,
 ) -> RepositoryInspection {
     let mut inspected = Vec::with_capacity(worktrees.len());
+    let mut integration_candidates = Vec::new();
     let mut issue = None;
 
     for (index, worktree) in worktrees.into_iter().enumerate() {
@@ -177,7 +192,17 @@ fn classify_after_fetch(
                     Ok(Some(upstream)) => {
                         match ref_exists(git_program, repository, &upstream, timeout) {
                             Ok(true) => WorktreeClassification::UpstreamExists,
-                            Ok(false) => WorktreeClassification::UpstreamMissing,
+                            Ok(false) => {
+                                integration_candidates.push((
+                                    inspected.len(),
+                                    IntegrationCandidate {
+                                        path: worktree.path.clone(),
+                                        branch: branch.to_owned(),
+                                        head: worktree.head.clone(),
+                                    },
+                                ));
+                                WorktreeClassification::IntegrationIndeterminate
+                            }
                             Err(message) => {
                                 issue.get_or_insert(message);
                                 WorktreeClassification::Malformed
@@ -206,9 +231,24 @@ fn classify_after_fetch(
         });
     }
 
+    let integration_error =
+        classify_integrations(repository, timeout, &mut inspected, &integration_candidates).err();
+    if let Some(integration_message) = integration_error.as_deref() {
+        if let Some(message) = issue.as_mut() {
+            message.push_str("; ");
+            message.push_str(integration_message);
+        } else {
+            issue = Some(integration_message.to_owned());
+        }
+    }
+
     if let Some(message) = issue {
         RepositoryInspection {
-            outcome: RepositoryInspectionOutcome::InspectionFailed,
+            outcome: if integration_error.is_some() {
+                RepositoryInspectionOutcome::IntegrationFailed
+            } else {
+                RepositoryInspectionOutcome::InspectionFailed
+            },
             message: Some(message),
             worktrees: inspected,
         }
@@ -217,6 +257,52 @@ fn classify_after_fetch(
             outcome: RepositoryInspectionOutcome::Inspected,
             message: None,
             worktrees: inspected,
+        }
+    }
+}
+
+fn classify_integrations(
+    repository: &Path,
+    timeout: Duration,
+    inspected: &mut [WorktreeInspection],
+    indexed_candidates: &[(usize, IntegrationCandidate)],
+) -> Result<(), String> {
+    let candidates: Vec<_> = indexed_candidates
+        .iter()
+        .map(|(_, candidate)| candidate.clone())
+        .collect();
+    match prove_integrations(repository, &candidates, timeout) {
+        Ok(proofs) => {
+            for ((index, _), proof) in indexed_candidates.iter().zip(proofs) {
+                inspected[*index].classification = classification_for_proof(proof);
+            }
+            Ok(())
+        }
+        Err(error) => {
+            for (index, _) in indexed_candidates {
+                inspected[*index].classification = WorktreeClassification::WorktrunkFailed;
+            }
+            Err(error.to_string())
+        }
+    }
+}
+
+const fn classification_for_proof(proof: IntegrationProof) -> WorktreeClassification {
+    match proof {
+        IntegrationProof::Integrated(reason) => match reason {
+            IntegrationReason::SameCommit => WorktreeClassification::IntegratedSameCommit,
+            IntegrationReason::Ancestor => WorktreeClassification::IntegratedAncestor,
+            IntegrationReason::NoAddedChanges => WorktreeClassification::IntegratedNoAddedChanges,
+            IntegrationReason::TreesMatch => WorktreeClassification::IntegratedTreesMatch,
+            IntegrationReason::MergeAddsNothing => {
+                WorktreeClassification::IntegratedMergeAddsNothing
+            }
+            IntegrationReason::PatchIdMatch => WorktreeClassification::IntegratedPatchIdMatch,
+        },
+        IntegrationProof::NotIntegrated => WorktreeClassification::NotIntegrated,
+        IntegrationProof::Indeterminate => WorktreeClassification::IntegrationIndeterminate,
+        IntegrationProof::DefaultBranchUnresolved => {
+            WorktreeClassification::DefaultBranchUnresolved
         }
     }
 }
@@ -666,7 +752,7 @@ mod tests {
         );
         assert_eq!(by_path[&keep], WorktreeClassification::UpstreamExists);
         assert_eq!(by_path[&second], WorktreeClassification::UpstreamExists);
-        assert_eq!(by_path[&gone], WorktreeClassification::UpstreamMissing);
+        assert_eq!(by_path[&gone], WorktreeClassification::IntegratedSameCommit);
         assert_eq!(by_path[&local], WorktreeClassification::NoUpstream);
         assert_eq!(by_path[&detached], WorktreeClassification::DetachedWorktree);
         assert_eq!(

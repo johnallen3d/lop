@@ -43,8 +43,14 @@ Operational state is stored in `~/.local/state/lop/state.json`, honoring
 as repository discovery input. A process-wide lock prevents overlapping runs.
 
 Repository roots are discovered from configuration; linked worktree paths come
-from Git rather than a directory convention. Scheduling support will target
-macOS LaunchAgents first while remaining separate from the normal CLI.
+from Git rather than a directory convention. For branches whose upstream has
+disappeared, Lop requires Worktrunk 0.66.0 or newer and explicitly consumes its
+versioned JSON schema. Only Worktrunk's positive local-Git integration proofs
+advance a worktree to later safety gates; missing, incompatible, malformed, or
+indeterminate results retain it.
+
+Scheduling support will target macOS LaunchAgents first while remaining
+separate from the normal CLI.
 
 ## Development
 
