@@ -103,10 +103,13 @@ fn scan_reports_discovered_repositories() {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(records.len(), 3);
+    assert_eq!(records.len(), 4);
     assert_eq!(records[1]["record"], "repository");
     assert_eq!(records[1]["reason_code"], "ok");
-    assert_eq!(records[2]["repositories_scanned"], 1);
+    assert_eq!(records[2]["record"], "worktree");
+    assert_eq!(records[2]["reason_code"], "main_worktree");
+    assert_eq!(records[3]["repositories_scanned"], 1);
+    assert_eq!(records[3]["worktrees_inspected"], 1);
 }
 
 #[test]

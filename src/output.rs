@@ -16,6 +16,7 @@ pub enum CommandName {
 pub enum RepositoryOutcome {
     Inspected,
     FetchFailed,
+    FetchTimedOut,
     Malformed,
 }
 
@@ -24,6 +25,7 @@ pub enum RepositoryOutcome {
 pub enum WorktreeOutcome {
     Retained,
     Candidate,
+    Skipped,
     Removed,
     Refused,
     Malformed,
@@ -38,8 +40,16 @@ pub enum ReasonCode {
     InaccessibleDirectory,
     UnsafeCanonicalization,
     FetchFailed,
+    FetchTimedOut,
     InvalidGitMetadata,
+    MalformedPorcelain,
     MainWorktree,
+    UpstreamExists,
+    NoUpstream,
+    DetachedWorktree,
+    DanglingSymbolicHead,
+    PrunableWorktree,
+    UpstreamMissing,
     NotIntegrated,
     DirtyWorktree,
     CheckedOutMultipleTimes,
@@ -102,6 +112,8 @@ pub enum Event<'a> {
         git_common_directory: Option<PathBuf>,
         outcome: RepositoryOutcome,
         reason_code: ReasonCode,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<&'a str>,
     },
     DiscoveryFailure {
         schema_version: u32,
@@ -171,6 +183,7 @@ mod tests {
             git_common_directory: Some(PathBuf::from("/src/project/.git")),
             outcome: RepositoryOutcome::FetchFailed,
             reason_code: ReasonCode::FetchFailed,
+            message: Some("network unavailable"),
         };
         let worktree = Event::Worktree {
             schema_version: OUTPUT_SCHEMA_VERSION,
