@@ -1,3 +1,4 @@
+pub mod cleanup;
 pub mod cli;
 pub mod config;
 pub mod discovery;
@@ -10,10 +11,13 @@ pub mod state;
 
 use std::{io::Write, time::Duration};
 
+use cleanup::{BranchOutcome, check_candidate, remove_worktree};
 use cli::{Cli, Command};
 use config::Config;
 use discovery::{DiscoveryIssueKind, discover};
-use inspection::{RepositoryInspectionOutcome, WorktreeClassification, inspect_repository};
+use inspection::{
+    RepositoryInspectionOutcome, WorktreeClassification, WorktreeInspection, inspect_repository,
+};
 use lock::RunLock;
 use output::{CommandName, Event, ReasonCode, RepositoryOutcome, Summary, WorktreeOutcome};
 use paths::AppPaths;
@@ -117,23 +121,17 @@ pub fn run_with_paths(
         )?;
 
         for worktree in inspection.worktrees {
-            let (worktree_outcome, worktree_reason) = worktree_result(worktree.classification);
-            summary.worktrees_inspected += 1;
-            match worktree_outcome {
-                WorktreeOutcome::Candidate => summary.candidates += 1,
-                WorktreeOutcome::Refused => summary.refusals += 1,
-                WorktreeOutcome::Malformed => summary.malformed_states += 1,
-                WorktreeOutcome::Retained | WorktreeOutcome::Skipped | WorktreeOutcome::Removed => {
-                }
-            }
+            let decision =
+                decide_worktree(&repository.path, &worktree, &config, apply, &mut summary);
             write_event(
                 output,
                 &Event::Worktree {
                     schema_version: output::OUTPUT_SCHEMA_VERSION,
                     repository: repository.path.clone(),
                     path: worktree.path,
-                    outcome: worktree_outcome,
-                    reason_code: worktree_reason,
+                    outcome: decision.outcome,
+                    reason_code: decision.reason_code,
+                    message: decision.message.as_deref(),
                 },
             )?;
         }
@@ -154,6 +152,78 @@ pub fn run_with_paths(
     write_event(output, &Event::summary(&summary))?;
     output.flush()?;
     Ok(summary)
+}
+
+struct WorktreeDecision {
+    outcome: WorktreeOutcome,
+    reason_code: ReasonCode,
+    message: Option<String>,
+}
+
+fn decide_worktree(
+    repository: &std::path::Path,
+    worktree: &WorktreeInspection,
+    config: &Config,
+    apply: bool,
+    summary: &mut Summary,
+) -> WorktreeDecision {
+    let (mut outcome, mut reason_code) = worktree_result(worktree.classification);
+    let mut message = None;
+    summary.worktrees_inspected += 1;
+
+    if outcome == WorktreeOutcome::Candidate {
+        match check_candidate(
+            repository,
+            worktree,
+            config.check_processes,
+            Duration::from_secs(config.fetch_timeout_seconds),
+        ) {
+            Ok(()) if apply => match remove_worktree(
+                repository,
+                &worktree.path,
+                Duration::from_secs(config.fetch_timeout_seconds),
+            ) {
+                Ok(result) => {
+                    outcome = WorktreeOutcome::Removed;
+                    reason_code = branch_outcome_reason(result.branch_outcome);
+                    if result.branch_outcome == BranchOutcome::RetainedFailed {
+                        summary.operational_failures += 1;
+                    }
+                    message = result
+                        .branch_checked_out_at
+                        .map(|path| format!("branch is also checked out at {}", path.display()));
+                }
+                Err(error) => {
+                    outcome = WorktreeOutcome::Refused;
+                    reason_code = ReasonCode::RemovalFailed;
+                    message = Some(error.to_string());
+                    summary.operational_failures += 1;
+                }
+            },
+            Ok(()) => {}
+            Err(refusal) => {
+                outcome = WorktreeOutcome::Refused;
+                reason_code = refusal.reason_code;
+                message = Some(refusal.message);
+                if refusal.operational_failure {
+                    summary.operational_failures += 1;
+                }
+            }
+        }
+    }
+
+    match outcome {
+        WorktreeOutcome::Candidate => summary.candidates += 1,
+        WorktreeOutcome::Refused => summary.refusals += 1,
+        WorktreeOutcome::Malformed => summary.malformed_states += 1,
+        WorktreeOutcome::Removed => summary.removals += 1,
+        WorktreeOutcome::Retained | WorktreeOutcome::Skipped => {}
+    }
+    WorktreeDecision {
+        outcome,
+        reason_code,
+        message,
+    }
 }
 
 const fn repository_result(
@@ -198,6 +268,9 @@ const fn worktree_result(classification: WorktreeClassification) -> (WorktreeOut
         WorktreeClassification::PrunableWorktree => {
             (WorktreeOutcome::Malformed, ReasonCode::PrunableWorktree)
         }
+        WorktreeClassification::LockedWorktree => {
+            (WorktreeOutcome::Refused, ReasonCode::LockedWorktree)
+        }
         WorktreeClassification::IntegratedSameCommit => {
             (WorktreeOutcome::Candidate, ReasonCode::IntegratedSameCommit)
         }
@@ -240,6 +313,19 @@ const fn worktree_result(classification: WorktreeClassification) -> (WorktreeOut
         WorktreeClassification::Malformed => {
             (WorktreeOutcome::Malformed, ReasonCode::InvalidGitMetadata)
         }
+    }
+}
+
+const fn branch_outcome_reason(outcome: BranchOutcome) -> ReasonCode {
+    match outcome {
+        BranchOutcome::Deleted => ReasonCode::BranchDeleted,
+        BranchOutcome::NotAttempted | BranchOutcome::Deferred => {
+            ReasonCode::BranchDeletionNotAttempted
+        }
+        BranchOutcome::RetainedUnmerged => ReasonCode::BranchRetainedUnmerged,
+        BranchOutcome::RetainedCheckedOut => ReasonCode::BranchRetainedCheckedOut,
+        BranchOutcome::RetainedRaced => ReasonCode::BranchRetainedRaced,
+        BranchOutcome::RetainedFailed => ReasonCode::BranchDeletionFailed,
     }
 }
 

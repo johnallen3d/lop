@@ -32,6 +32,7 @@ pub enum WorktreeClassification {
     DetachedWorktree,
     DanglingSymbolicHead,
     PrunableWorktree,
+    LockedWorktree,
     IntegratedSameCommit,
     IntegratedAncestor,
     IntegratedNoAddedChanges,
@@ -50,6 +51,8 @@ pub enum WorktreeClassification {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct WorktreeInspection {
     pub path: PathBuf,
+    pub head: String,
+    pub branch: Option<String>,
     pub classification: WorktreeClassification,
 }
 
@@ -60,6 +63,7 @@ pub struct RepositoryInspection {
     pub worktrees: Vec<WorktreeInspection>,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct PorcelainWorktree {
     path: PathBuf,
@@ -67,7 +71,20 @@ struct PorcelainWorktree {
     branch: Option<String>,
     detached: bool,
     prunable: bool,
+    locked: bool,
     bare: bool,
+}
+
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct InventoryWorktree {
+    pub path: PathBuf,
+    pub head: String,
+    pub branch: Option<String>,
+    pub detached: bool,
+    pub prunable: bool,
+    pub locked: bool,
+    pub bare: bool,
 }
 
 /// Fetches and classifies all worktrees belonging to a repository.
@@ -78,6 +95,40 @@ struct PorcelainWorktree {
 #[must_use]
 pub fn inspect_repository(repository: &Path, fetch_timeout: Duration) -> RepositoryInspection {
     inspect_repository_with_git(repository, fetch_timeout, Path::new("git"))
+}
+
+pub(crate) fn worktree_inventory(
+    repository: &Path,
+    timeout: Duration,
+) -> Result<Vec<InventoryWorktree>, String> {
+    let output = run_git(
+        Path::new("git"),
+        repository,
+        &["worktree", "list", "--porcelain", "-z"],
+        timeout,
+        false,
+    )
+    .map_err(|error| command_error("git worktree list", error))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git worktree list failed: {}",
+            stderr_message(&output.stderr)
+        ));
+    }
+    parse_porcelain(&output.stdout).map(|worktrees| {
+        worktrees
+            .into_iter()
+            .map(|worktree| InventoryWorktree {
+                path: worktree.path,
+                head: worktree.head,
+                branch: worktree.branch,
+                detached: worktree.detached,
+                prunable: worktree.prunable,
+                locked: worktree.locked,
+                bare: worktree.bare,
+            })
+            .collect()
+    })
 }
 
 fn inspect_repository_with_git(
@@ -155,6 +206,8 @@ fn classify_without_fetch(
         .into_iter()
         .map(|worktree| WorktreeInspection {
             path: worktree.path,
+            head: worktree.head,
+            branch: worktree.branch,
             classification,
         })
         .collect()
@@ -175,6 +228,8 @@ fn classify_after_fetch(
             WorktreeClassification::MainWorktree
         } else if worktree.prunable {
             WorktreeClassification::PrunableWorktree
+        } else if worktree.locked {
+            WorktreeClassification::LockedWorktree
         } else if worktree.detached {
             WorktreeClassification::DetachedWorktree
         } else if let Some(branch) = worktree.branch.as_deref() {
@@ -227,6 +282,8 @@ fn classify_after_fetch(
 
         inspected.push(WorktreeInspection {
             path: worktree.path,
+            head: worktree.head,
+            branch: worktree.branch,
             classification,
         });
     }
@@ -399,6 +456,7 @@ fn parse_record(fields: &[&[u8]]) -> Result<PorcelainWorktree, String> {
     let mut branch = None;
     let mut detached = false;
     let mut prunable = false;
+    let mut locked = false;
     let mut bare = false;
 
     for field in &fields[1..] {
@@ -422,7 +480,10 @@ fn parse_record(fields: &[&[u8]]) -> Result<PorcelainWorktree, String> {
             }
             prunable = true;
         } else if *field == b"locked" || field.starts_with(b"locked ") {
-            // Locking is a later safety gate, but it is valid porcelain here.
+            if locked {
+                return Err("malformed worktree porcelain: duplicate locked field".to_owned());
+            }
+            locked = true;
         } else {
             return Err(format!(
                 "malformed worktree porcelain: unknown field {:?}",
@@ -444,6 +505,7 @@ fn parse_record(fields: &[&[u8]]) -> Result<PorcelainWorktree, String> {
         branch,
         detached,
         prunable,
+        locked,
         bare,
     })
 }
@@ -713,6 +775,8 @@ mod tests {
         let dangling = add_worktree(&repository, &worktrees, "dangling");
         let prunable = add_worktree(&repository, &worktrees, "prunable");
         let second = add_worktree(&repository, &worktrees, "second");
+        git(&repository, &["worktree", "lock", local.to_str().unwrap()]);
+
         let detached = worktrees.join("detached checkout");
         git(
             &repository,
@@ -753,7 +817,7 @@ mod tests {
         assert_eq!(by_path[&keep], WorktreeClassification::UpstreamExists);
         assert_eq!(by_path[&second], WorktreeClassification::UpstreamExists);
         assert_eq!(by_path[&gone], WorktreeClassification::IntegratedSameCommit);
-        assert_eq!(by_path[&local], WorktreeClassification::NoUpstream);
+        assert_eq!(by_path[&local], WorktreeClassification::LockedWorktree);
         assert_eq!(by_path[&detached], WorktreeClassification::DetachedWorktree);
         assert_eq!(
             by_path[&dangling],

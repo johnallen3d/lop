@@ -49,6 +49,13 @@ versioned JSON schema. Only Worktrunk's positive local-Git integration proofs
 advance a worktree to later safety gates; missing, incompatible, malformed, or
 indeterminate results retain it.
 
+Before removal, Lop rechecks the branch and HEAD, lock state, checkout topology,
+tracked and untracked changes, and live-process working directories. Process
+inspection uses `lsof` on macOS and fails closed when it is unavailable. The
+`check_processes = false` setting is an explicit opt-out from that gate. Lop then
+runs a foreground, confirmed Worktrunk removal without force, force-delete, or
+process-reaping flags, and reports Worktrunk's branch-deletion outcome.
+
 Scheduling support will target macOS LaunchAgents first while remaining
 separate from the normal CLI.
 

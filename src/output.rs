@@ -50,6 +50,7 @@ pub enum ReasonCode {
     DetachedWorktree,
     DanglingSymbolicHead,
     PrunableWorktree,
+    LockedWorktree,
     UpstreamMissing,
     IntegratedSameCommit,
     IntegratedAncestor,
@@ -64,8 +65,17 @@ pub enum ReasonCode {
     DirtyWorktree,
     CheckedOutMultipleTimes,
     ProcessUsingWorktree,
+    SafetyInspectionFailed,
+    WorktreeMissing,
+    WorktreeChanged,
     RemovalNotConfirmed,
     RemovalFailed,
+    BranchDeleted,
+    BranchDeletionNotAttempted,
+    BranchRetainedUnmerged,
+    BranchRetainedRaced,
+    BranchRetainedCheckedOut,
+    BranchDeletionFailed,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
@@ -137,6 +147,8 @@ pub enum Event<'a> {
         path: PathBuf,
         outcome: WorktreeOutcome,
         reason_code: ReasonCode,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<&'a str>,
     },
     Summary {
         #[serde(flatten)]
@@ -201,6 +213,7 @@ mod tests {
             path: PathBuf::from("/src/project-feature"),
             outcome: WorktreeOutcome::Refused,
             reason_code: ReasonCode::DirtyWorktree,
+            message: None,
         };
 
         assert_eq!(
