@@ -4,7 +4,9 @@ use std::{
     process::{Command, Output},
 };
 
-use serde_json::Value;
+use serde_json::{Value, json};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use tempfile::TempDir;
 
 struct Fixture {
@@ -106,16 +108,23 @@ impl Fixture {
     }
 
     fn prune(&self) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_lop"))
+        self.prune_with_path(None)
+    }
+
+    fn prune_with_path(&self, path: Option<&std::ffi::OsStr>) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_lop"));
+        command
             .args(["prune", "--yes"])
             .current_dir(self.directory.path())
             .env("HOME", self.directory.path())
             .env("XDG_CONFIG_HOME", &self.config_home)
             .env("XDG_STATE_HOME", &self.state_home)
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
-            .unwrap()
+            .env("GIT_TERMINAL_PROMPT", "0");
+        if let Some(path) = path {
+            command.env("PATH", path);
+        }
+        command.output().unwrap()
     }
 }
 
@@ -226,6 +235,96 @@ fn locked_worktree_is_refused_without_invoking_removal() {
     let record = worktree_record(&records, &worktree);
     assert_eq!(record["outcome"], "refused");
     assert_eq!(record["reason_code"], "locked_worktree");
+}
+
+#[cfg(unix)]
+#[test]
+fn herdr_cleanup_failure_preserves_completed_removal_result() {
+    let fixture = Fixture::new();
+    let worktree = fixture.integrated_worktree("herdr-cleanup-failure");
+    let bin = fixture.directory.path().join("bin");
+    let snapshot_path = fixture.directory.path().join("herdr-snapshot.json");
+    let close_log = fixture.directory.path().join("herdr-close.log");
+    fs::create_dir(&bin).unwrap();
+    fs::write(
+        &snapshot_path,
+        serde_json::to_vec(&json!({
+            "id": "test",
+            "result": {
+                "type": "session_snapshot",
+                "snapshot": {
+                    "version": "0.9.0",
+                    "protocol": 22,
+                    "focused_pane_id": null,
+                    "panes": [{
+                        "pane_id": "w1:p1",
+                        "workspace_id": "w1",
+                        "focused": false,
+                        "cwd": worktree,
+                        "foreground_cwd": worktree,
+                        "agent": "pi",
+                        "agent_status": "idle"
+                    }],
+                    "agents": [{
+                        "pane_id": "w1:p1",
+                        "workspace_id": "w1",
+                        "cwd": worktree,
+                        "foreground_cwd": worktree,
+                        "agent_status": "idle"
+                    }],
+                    "workspaces": [{
+                        "workspace_id": "w1",
+                        "worktree": {"checkout_path": worktree}
+                    }]
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let herdr = bin.join("herdr");
+    fs::write(
+        &herdr,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = api ]; then cat '{}'; else printf '%s\\n' \"$*\" > '{}'; echo cleanup-failed >&2; exit 1; fi\n",
+            snapshot_path.display(),
+            close_log.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&herdr).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&herdr, permissions).unwrap();
+    let mut paths = vec![bin];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let path = std::env::join_paths(paths).unwrap();
+
+    let output = fixture.prune_with_path(Some(&path));
+
+    assert!(!output.status.success());
+    assert!(!worktree.exists());
+    assert!(!ref_exists(
+        &fixture.repository,
+        "refs/heads/herdr-cleanup-failure"
+    ));
+    let records = records(&output);
+    let record = worktree_record(&records, &worktree);
+    assert_eq!(record["outcome"], "removed");
+    assert_eq!(record["reason_code"], "herdr_cleanup_failed");
+    assert!(
+        record["message"]
+            .as_str()
+            .unwrap()
+            .contains("cleanup-failed")
+    );
+    assert_eq!(records.last().unwrap()["removals"], 1);
+    assert_eq!(records.last().unwrap()["operational_failures"], 1);
+    assert_eq!(
+        fs::read_to_string(close_log).unwrap().trim(),
+        "workspace close w1"
+    );
 }
 
 fn records(output: &Output) -> Vec<Value> {

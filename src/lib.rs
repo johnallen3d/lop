@@ -2,6 +2,7 @@ pub mod cleanup;
 pub mod cli;
 pub mod config;
 pub mod discovery;
+pub mod herdr;
 pub mod inspection;
 pub mod integration;
 pub mod lock;
@@ -15,6 +16,7 @@ use cleanup::{BranchOutcome, check_candidate, remove_worktree};
 use cli::{Cli, Command};
 use config::Config;
 use discovery::{DiscoveryIssueKind, discover};
+use herdr::{CandidateStatus, cleanup_removed, inspect_candidate};
 use inspection::{
     RepositoryInspectionOutcome, WorktreeClassification, WorktreeInspection, inspect_repository,
 };
@@ -172,17 +174,45 @@ fn decide_worktree(
     summary.worktrees_inspected += 1;
 
     if outcome == WorktreeOutcome::Candidate {
-        match check_candidate(
-            repository,
-            worktree,
-            config.check_processes,
-            Duration::from_secs(config.fetch_timeout_seconds),
-        ) {
-            Ok(()) if apply => match remove_worktree(
-                repository,
-                &worktree.path,
-                Duration::from_secs(config.fetch_timeout_seconds),
-            ) {
+        let timeout = Duration::from_secs(config.fetch_timeout_seconds);
+        let coordination =
+            match check_candidate(repository, worktree, config.check_processes, timeout) {
+                Ok(()) => match inspect_candidate(&worktree.path, timeout) {
+                    Ok(CandidateStatus::Unavailable) => Some(None),
+                    Ok(CandidateStatus::Clear(coordination)) => Some(Some(coordination)),
+                    Ok(CandidateStatus::FocusedPane { pane_id }) => {
+                        outcome = WorktreeOutcome::Refused;
+                        reason_code = ReasonCode::HerdrFocusedPane;
+                        message = Some(format!("Herdr pane {pane_id} is focused in the worktree"));
+                        None
+                    }
+                    Ok(CandidateStatus::ActiveAgent { pane_id }) => {
+                        outcome = WorktreeOutcome::Refused;
+                        reason_code = ReasonCode::HerdrActiveAgent;
+                        message = Some(format!("Herdr pane {pane_id} contains an active agent"));
+                        None
+                    }
+                    Err(error) => {
+                        outcome = WorktreeOutcome::Refused;
+                        reason_code = ReasonCode::HerdrInspectionFailed;
+                        message = Some(error.to_string());
+                        summary.operational_failures += 1;
+                        None
+                    }
+                },
+                Err(refusal) => {
+                    outcome = WorktreeOutcome::Refused;
+                    reason_code = refusal.reason_code;
+                    message = Some(refusal.message);
+                    if refusal.operational_failure {
+                        summary.operational_failures += 1;
+                    }
+                    None
+                }
+            };
+
+        if apply && let Some(coordination) = coordination {
+            match remove_worktree(repository, &worktree.path, timeout) {
                 Ok(result) => {
                     outcome = WorktreeOutcome::Removed;
                     reason_code = branch_outcome_reason(result.branch_outcome);
@@ -192,20 +222,26 @@ fn decide_worktree(
                     message = result
                         .branch_checked_out_at
                         .map(|path| format!("branch is also checked out at {}", path.display()));
+
+                    if let Some(coordination) = coordination
+                        && let Err(error) = cleanup_removed(&coordination, timeout)
+                    {
+                        reason_code = ReasonCode::HerdrCleanupFailed;
+                        let cleanup_message = format!(
+                            "Git worktree removal completed ({:?}); {error}",
+                            result.branch_outcome
+                        );
+                        message = Some(match message {
+                            Some(existing) => format!("{existing}; {cleanup_message}"),
+                            None => cleanup_message,
+                        });
+                        summary.operational_failures += 1;
+                    }
                 }
                 Err(error) => {
                     outcome = WorktreeOutcome::Refused;
                     reason_code = ReasonCode::RemovalFailed;
                     message = Some(error.to_string());
-                    summary.operational_failures += 1;
-                }
-            },
-            Ok(()) => {}
-            Err(refusal) => {
-                outcome = WorktreeOutcome::Refused;
-                reason_code = refusal.reason_code;
-                message = Some(refusal.message);
-                if refusal.operational_failure {
                     summary.operational_failures += 1;
                 }
             }

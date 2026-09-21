@@ -52,9 +52,18 @@ indeterminate results retain it.
 Before removal, Lop rechecks the branch and HEAD, lock state, checkout topology,
 tracked and untracked changes, and live-process working directories. Process
 inspection uses `lsof` on macOS and fails closed when it is unavailable. The
-`check_processes = false` setting is an explicit opt-out from that gate. Lop then
-runs a foreground, confirmed Worktrunk removal without force, force-delete, or
-process-reaping flags, and reports Worktrunk's branch-deletion outcome.
+`check_processes = false` setting is an explicit opt-out from that gate.
+
+Herdr coordination is automatic but optional. When a compatible Herdr client and
+socket are available, Lop refuses candidates containing a focused pane or active
+agent and fails closed on incomplete candidate activity. A missing client or
+unavailable socket does not weaken the independent Git, Worktrunk, and process
+checks. After Worktrunk confirms removal, Lop closes only Herdr workspaces mapped
+to that checkout; a coordination failure is reported without obscuring the
+completed Git removal.
+
+Lop runs a foreground, confirmed Worktrunk removal without force, force-delete,
+or process-reaping flags, and reports Worktrunk's branch-deletion outcome.
 
 Scheduling support will target macOS LaunchAgents first while remaining
 separate from the normal CLI.
