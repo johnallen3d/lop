@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     fs,
     path::{Path, PathBuf},
 };
@@ -57,8 +56,6 @@ pub enum ConfigError {
         "invalid configuration: '~user' expansion is unsupported in root {root:?}; use an absolute path"
     )]
     UnsupportedTilde { root: String },
-    #[error("invalid configuration: duplicate root {root}")]
-    DuplicateRoot { root: PathBuf },
     #[error("invalid configuration: scan_depth must be greater than zero")]
     InvalidScanDepth,
     #[error("invalid configuration: fetch_timeout_seconds must be greater than zero")]
@@ -104,13 +101,8 @@ impl Config {
         }
 
         let mut roots = Vec::with_capacity(raw.roots.len());
-        let mut unique = HashSet::with_capacity(raw.roots.len());
         for root in raw.roots {
-            let expanded = expand_root(&root, home)?;
-            if !unique.insert(expanded.clone()) {
-                return Err(ConfigError::DuplicateRoot { root: expanded });
-            }
-            roots.push(expanded);
+            roots.push(expand_root(&root, home)?);
         }
 
         Ok(Self {
@@ -204,6 +196,12 @@ mod tests {
             Config::validate(raw(&["~other/src"]), None),
             Err(ConfigError::UnsupportedTilde { .. })
         ));
+    }
+
+    #[test]
+    fn preserves_duplicate_roots_for_discovery_to_deduplicate() {
+        let config = Config::validate(raw(&["/src", "/src"]), None).unwrap();
+        assert_eq!(config.roots, [Path::new("/src"), Path::new("/src")]);
     }
 
     #[test]

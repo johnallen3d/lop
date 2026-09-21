@@ -34,6 +34,9 @@ pub enum WorktreeOutcome {
 #[serde(rename_all = "snake_case")]
 pub enum ReasonCode {
     Ok,
+    InaccessibleRoot,
+    InaccessibleDirectory,
+    UnsafeCanonicalization,
     FetchFailed,
     InvalidGitMetadata,
     MainWorktree,
@@ -99,6 +102,12 @@ pub enum Event<'a> {
         git_common_directory: Option<PathBuf>,
         outcome: RepositoryOutcome,
         reason_code: ReasonCode,
+    },
+    DiscoveryFailure {
+        schema_version: u32,
+        path: PathBuf,
+        reason_code: ReasonCode,
+        message: &'a str,
     },
     Worktree {
         schema_version: u32,
