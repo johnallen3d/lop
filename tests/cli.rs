@@ -108,8 +108,25 @@ fn scan_reports_discovered_repositories() {
     assert_eq!(records[1]["reason_code"], "ok");
     assert_eq!(records[2]["record"], "worktree");
     assert_eq!(records[2]["reason_code"], "main_worktree");
+    assert_eq!(records[2]["classification_changed"], true);
     assert_eq!(records[3]["repositories_scanned"], 1);
     assert_eq!(records[3]["worktrees_inspected"], 1);
+
+    let repeated = lop()
+        .arg("scan")
+        .env("HOME", directory.path())
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .output()
+        .unwrap();
+    assert!(repeated.status.success());
+    let repeated_records: Vec<Value> = String::from_utf8(repeated.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(repeated_records[2]["reason_code"], "main_worktree");
+    assert_eq!(repeated_records[2]["classification_changed"], false);
 }
 
 #[test]

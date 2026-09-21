@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use serde::Serialize;
 
-pub const OUTPUT_SCHEMA_VERSION: u32 = 1;
+pub const OUTPUT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -151,6 +151,8 @@ pub enum Event<'a> {
         path: PathBuf,
         outcome: WorktreeOutcome,
         reason_code: ReasonCode,
+        /// True when the outcome or reason differs from the last completed run.
+        classification_changed: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         message: Option<&'a str>,
     },
@@ -217,6 +219,7 @@ mod tests {
             path: PathBuf::from("/src/project-feature"),
             outcome: WorktreeOutcome::Refused,
             reason_code: ReasonCode::DirtyWorktree,
+            classification_changed: true,
             message: None,
         };
 
@@ -224,10 +227,9 @@ mod tests {
             serde_json::to_value(repository).unwrap()["reason_code"],
             "fetch_failed"
         );
-        assert_eq!(
-            serde_json::to_value(worktree).unwrap()["reason_code"],
-            "dirty_worktree"
-        );
+        let worktree = serde_json::to_value(worktree).unwrap();
+        assert_eq!(worktree["reason_code"], "dirty_worktree");
+        assert_eq!(worktree["classification_changed"], true);
     }
 
     #[test]

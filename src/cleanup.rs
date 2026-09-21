@@ -587,6 +587,7 @@ mod tests {
             &repository,
             &["config", "user.email", "test@example.invalid"],
         );
+        git(&repository, &["config", "commit.gpgsign", "false"]);
         fs::write(repository.join("base"), "base\n").unwrap();
         git(&repository, &["add", "base"]);
         git(&repository, &["commit", "--quiet", "-m", "base"]);

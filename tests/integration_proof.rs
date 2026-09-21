@@ -30,6 +30,7 @@ impl RepositoryFixture {
             &repository,
             &["config", "user.email", "lop@example.invalid"],
         );
+        git(&repository, &["config", "commit.gpgsign", "false"]);
         fs::write(repository.join("base.txt"), "base\n").unwrap();
         git(&repository, &["add", "base.txt"]);
         git(&repository, &["commit", "--quiet", "-m", "base"]);

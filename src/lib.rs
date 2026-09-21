@@ -11,7 +11,7 @@ pub mod paths;
 pub mod schedule;
 pub mod state;
 
-use std::{io::Write, time::Duration};
+use std::{collections::BTreeMap, io::Write, time::Duration};
 
 use cleanup::{BranchOutcome, check_candidate, remove_worktree};
 use cli::{Cli, Command};
@@ -24,7 +24,7 @@ use inspection::{
 use lock::RunLock;
 use output::{CommandName, Event, ReasonCode, RepositoryOutcome, Summary, WorktreeOutcome};
 use paths::AppPaths;
-use state::State;
+use state::{ClassificationState, State};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -68,7 +68,7 @@ pub fn run_with_paths(
 ) -> Result<Summary, Error> {
     let _lock = RunLock::acquire(&paths.lock_file)?;
     let config = Config::load(&paths.config_file)?;
-    let state = State::load(&paths.state_file)?;
+    let mut state = State::load(&paths.state_file)?;
 
     let (command, apply) = match &cli.command {
         Command::Scan => (CommandName::Scan, false),
@@ -97,22 +97,7 @@ pub fn run_with_paths(
             Duration::from_secs(config.fetch_timeout_seconds),
         );
         let (repository_outcome, repository_reason) = repository_result(inspection.outcome);
-        if inspection.outcome != RepositoryInspectionOutcome::Inspected {
-            summary.operational_failures += 1;
-        }
-        if matches!(
-            inspection.outcome,
-            RepositoryInspectionOutcome::FetchFailed | RepositoryInspectionOutcome::FetchTimedOut
-        ) {
-            summary.fetch_failures += 1;
-        }
-        if matches!(
-            inspection.outcome,
-            RepositoryInspectionOutcome::MalformedPorcelain
-                | RepositoryInspectionOutcome::InspectionFailed
-        ) {
-            summary.malformed_states += 1;
-        }
+        update_repository_summary(&mut summary, inspection.outcome);
 
         write_event(
             output,
@@ -126,9 +111,26 @@ pub fn run_with_paths(
             },
         )?;
 
+        let repository_key = repository
+            .git_common_directory
+            .to_string_lossy()
+            .into_owned();
+        let previous_classifications = state
+            .repositories
+            .get(&repository_key)
+            .map(|repository| &repository.last_classifications);
+        let mut current_classifications = BTreeMap::new();
+
         for worktree in inspection.worktrees {
             let decision =
                 decide_worktree(&repository.path, &worktree, &config, apply, &mut summary);
+            let classification_changed = record_classification(
+                previous_classifications,
+                &mut current_classifications,
+                &worktree.path,
+                &decision,
+            );
+
             write_event(
                 output,
                 &Event::Worktree {
@@ -137,10 +139,17 @@ pub fn run_with_paths(
                     path: worktree.path,
                     outcome: decision.outcome,
                     reason_code: decision.reason_code,
+                    classification_changed,
                     message: decision.message.as_deref(),
                 },
             )?;
         }
+
+        state
+            .repositories
+            .entry(repository_key)
+            .or_default()
+            .last_classifications = current_classifications;
     }
     for issue in &discovery.issues {
         write_event(
@@ -376,6 +385,50 @@ const fn reason_code(kind: DiscoveryIssueKind) -> ReasonCode {
         DiscoveryIssueKind::UnsafeCanonicalization => ReasonCode::UnsafeCanonicalization,
         DiscoveryIssueKind::InvalidGitMetadata => ReasonCode::InvalidGitMetadata,
     }
+}
+
+fn update_repository_summary(summary: &mut Summary, outcome: RepositoryInspectionOutcome) {
+    if outcome != RepositoryInspectionOutcome::Inspected {
+        summary.operational_failures += 1;
+    }
+    if matches!(
+        outcome,
+        RepositoryInspectionOutcome::FetchFailed | RepositoryInspectionOutcome::FetchTimedOut
+    ) {
+        summary.fetch_failures += 1;
+    }
+    if matches!(
+        outcome,
+        RepositoryInspectionOutcome::MalformedPorcelain
+            | RepositoryInspectionOutcome::InspectionFailed
+    ) {
+        summary.malformed_states += 1;
+    }
+}
+
+fn record_classification(
+    previous: Option<&BTreeMap<String, ClassificationState>>,
+    current: &mut BTreeMap<String, ClassificationState>,
+    path: &std::path::Path,
+    decision: &WorktreeDecision,
+) -> bool {
+    let path = path.to_string_lossy().into_owned();
+    let classification = ClassificationState {
+        classification: serialized_name(decision.outcome),
+        reason_code: serialized_name(decision.reason_code),
+    };
+    let changed =
+        previous.and_then(|classifications| classifications.get(&path)) != Some(&classification);
+    current.insert(path, classification);
+    changed
+}
+
+fn serialized_name(value: impl serde::Serialize) -> String {
+    serde_json::to_value(value)
+        .expect("unit enums serialize without failure")
+        .as_str()
+        .expect("output enums serialize as strings")
+        .to_owned()
 }
 
 fn write_event(output: &mut impl Write, event: &Event<'_>) -> std::io::Result<()> {

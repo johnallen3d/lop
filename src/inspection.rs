@@ -694,6 +694,7 @@ mod tests {
         git(path, &["init", "--quiet", "--initial-branch=main"]);
         git(path, &["config", "user.name", "Lop Test"]);
         git(path, &["config", "user.email", "lop@example.invalid"]);
+        git(path, &["config", "commit.gpgsign", "false"]);
         fs::write(path.join("README"), "fixture\n").unwrap();
         git(path, &["add", "README"]);
         git(path, &["commit", "--quiet", "-m", "fixture"]);

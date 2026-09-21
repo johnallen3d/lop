@@ -18,9 +18,12 @@ dry run unless `--yes` is present. Scheduler and Herdr integrations are optional
 cleanup runs.
 
 Lop emits newline-delimited JSON records. Every record includes a schema
-version, and repository/worktree records use stable reason codes. A run returns
-nonzero for operational failures, while safety refusals are reported without
-making the run fail.
+version, and repository/worktree records use stable reason codes. Worktree
+records include `classification_changed`; it is `true` on the first observation
+or when the outcome/reason changes, and `false` on repeated identical scans so
+notification consumers can suppress duplicates without losing inventory. A run
+returns nonzero for operational failures, while safety refusals are reported
+without making the run fail.
 
 ## Configuration
 
@@ -93,6 +96,13 @@ than relying on an interactive shell. Lop's process-wide lock prevents overlap.
 Install and uninstall are safe to repeat; uninstall removes the LaunchAgent and
 schedule settings while retaining logs. Other platforms return a scheduling-
 unavailable error without changing manual command behavior.
+
+Keep the schedule in `scan` mode while reviewing preview evidence. Enabling
+`prune` mode requires separate explicit approval after false positives are
+resolved. To roll back unattended cleanup, use `lop schedule edit` and set
+`mode = "scan"`; to stop all scheduled runs, use `lop schedule uninstall`.
+After the first approved cleanup run, manually compare every `removed` record's
+`branch_*` reason code with Git's surviving worktrees and local branches.
 
 ## Declarative package
 
