@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     io::Read,
     path::{Path, PathBuf},
@@ -23,20 +24,20 @@ pub struct SafetyRefusal {
 }
 
 pub trait ProcessInspector {
-    /// Reports whether a live process has its current directory at or below `worktree`.
+    /// Returns live process IDs whose current directory is at or below `worktree`.
     ///
     /// # Errors
     ///
     /// Returns an error when process information cannot be obtained completely and safely.
-    fn worktree_in_use(&self, worktree: &Path, timeout: Duration) -> Result<bool, String>;
+    fn worktree_users(&self, worktree: &Path, timeout: Duration) -> Result<BTreeSet<u32>, String>;
 }
 
 #[derive(Debug, Copy, Clone, Default)]
 pub struct PlatformProcessInspector;
 
 impl ProcessInspector for PlatformProcessInspector {
-    fn worktree_in_use(&self, worktree: &Path, timeout: Duration) -> Result<bool, String> {
-        platform_worktree_in_use(worktree, timeout)
+    fn worktree_users(&self, worktree: &Path, timeout: Duration) -> Result<BTreeSet<u32>, String> {
+        platform_worktree_users(worktree, timeout)
     }
 }
 
@@ -51,11 +52,36 @@ pub fn check_candidate(
     check_processes: bool,
     timeout: Duration,
 ) -> Result<(), SafetyRefusal> {
+    check_candidate_ignoring_processes(
+        repository,
+        candidate,
+        check_processes,
+        timeout,
+        &BTreeSet::new(),
+    )
+}
+
+/// Rechecks candidate safety while disregarding only the supplied process IDs.
+///
+/// This is used for previewing a candidate whose known idle Herdr terminal
+/// processes will be retired before any removal is attempted.
+///
+/// # Errors
+///
+/// Returns a fail-closed refusal for every non-attributed process or unsafe fact.
+pub fn check_candidate_ignoring_processes(
+    repository: &Path,
+    candidate: &WorktreeInspection,
+    check_processes: bool,
+    timeout: Duration,
+    ignored_processes: &BTreeSet<u32>,
+) -> Result<(), SafetyRefusal> {
     check_candidate_with_inspector(
         repository,
         candidate,
         check_processes,
         timeout,
+        ignored_processes,
         &PlatformProcessInspector,
     )
 }
@@ -65,6 +91,7 @@ fn check_candidate_with_inspector(
     candidate: &WorktreeInspection,
     check_processes: bool,
     timeout: Duration,
+    ignored_processes: &BTreeSet<u32>,
     process_inspector: &impl ProcessInspector,
 ) -> Result<(), SafetyRefusal> {
     let inventory = worktree_inventory(repository, timeout)
@@ -156,21 +183,31 @@ fn check_candidate_with_inspector(
     }
 
     if check_processes {
-        match process_inspector.worktree_in_use(&canonical, timeout) {
-            Ok(true) => {
-                return Err(refusal(
-                    ReasonCode::ProcessUsingWorktree,
-                    "a live process has its current directory in the worktree",
-                ));
-            }
-            Ok(false) => {}
-            Err(message) => {
-                return Err(inspection_failure("process inspection", &message));
-            }
-        }
+        check_worktree_processes(process_inspector, &canonical, timeout, ignored_processes)?;
     }
 
     Ok(())
+}
+
+fn check_worktree_processes(
+    process_inspector: &impl ProcessInspector,
+    worktree: &Path,
+    timeout: Duration,
+    ignored_processes: &BTreeSet<u32>,
+) -> Result<(), SafetyRefusal> {
+    match process_inspector.worktree_users(worktree, timeout) {
+        Ok(processes) if processes.is_subset(ignored_processes) => Ok(()),
+        Ok(processes) => {
+            let external: Vec<_> = processes.difference(ignored_processes).copied().collect();
+            Err(refusal(
+                ReasonCode::ProcessUsingWorktree,
+                format!(
+                    "live process IDs {external:?} have their current directory in the worktree"
+                ),
+            ))
+        }
+        Err(message) => Err(inspection_failure("process inspection", &message)),
+    }
 }
 
 fn exact_inventory_entry<'a>(
@@ -334,7 +371,7 @@ fn parse_removal(bytes: &[u8], expected_path: &Path) -> Result<RemovalResult, Re
 }
 
 #[cfg(target_os = "macos")]
-fn platform_worktree_in_use(worktree: &Path, timeout: Duration) -> Result<bool, String> {
+fn platform_worktree_users(worktree: &Path, timeout: Duration) -> Result<BTreeSet<u32>, String> {
     let output = run_process(
         Path::new("/usr/sbin/lsof"),
         &["-n", "-w", "-a", "-d", "cwd", "-F0pn"],
@@ -351,24 +388,37 @@ fn platform_worktree_in_use(worktree: &Path, timeout: Duration) -> Result<bool, 
 }
 
 #[cfg(not(target_os = "macos"))]
-fn platform_worktree_in_use(_worktree: &Path, _timeout: Duration) -> Result<bool, String> {
+fn platform_worktree_users(_worktree: &Path, _timeout: Duration) -> Result<BTreeSet<u32>, String> {
     Err("process inspection is not implemented on this platform".to_owned())
 }
 
-fn parse_lsof_cwds(bytes: &[u8], worktree: &Path) -> Result<bool, String> {
+fn parse_lsof_cwds(bytes: &[u8], worktree: &Path) -> Result<BTreeSet<u32>, String> {
+    let mut process_id = None;
+    let mut matches = BTreeSet::new();
     for field in bytes.split(|byte| *byte == 0 || *byte == b'\n') {
+        if let Some(raw_process_id) = field.strip_prefix(b"p") {
+            process_id = Some(
+                std::str::from_utf8(raw_process_id)
+                    .map_err(|_| "lsof returned a non-UTF-8 process ID".to_owned())?
+                    .parse::<u32>()
+                    .map_err(|_| "lsof returned an invalid process ID".to_owned())?,
+            );
+            continue;
+        }
         let Some(path) = field.strip_prefix(b"n") else {
             continue;
         };
         if path.is_empty() {
             return Err("lsof returned an empty current-directory path".to_owned());
         }
+        let process_id = process_id
+            .ok_or_else(|| "lsof returned a current directory without a process ID".to_owned())?;
         let path = path_from_bytes(path);
         if path == worktree || path.starts_with(worktree) {
-            return Ok(true);
+            matches.insert(process_id);
         }
     }
-    Ok(false)
+    Ok(matches)
 }
 
 #[cfg(unix)]
@@ -462,7 +512,7 @@ fn stderr_message(stderr: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path, time::Duration};
+    use std::{collections::BTreeSet, fs, path::Path, time::Duration};
 
     use serde_json::json;
     #[cfg(unix)]
@@ -481,8 +531,15 @@ mod tests {
     #[test]
     fn lsof_cwd_detection_only_matches_the_worktree_or_descendants() {
         let bytes = b"p12\0fcwd\0n/tmp/project\0\np13\0fcwd\0n/tmp/project-worktree/subdir\0\n";
-        assert!(parse_lsof_cwds(bytes, Path::new("/tmp/project-worktree")).unwrap());
-        assert!(!parse_lsof_cwds(bytes, Path::new("/tmp/other")).unwrap());
+        assert_eq!(
+            parse_lsof_cwds(bytes, Path::new("/tmp/project-worktree")).unwrap(),
+            BTreeSet::from([13])
+        );
+        assert!(
+            parse_lsof_cwds(bytes, Path::new("/tmp/other"))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -563,7 +620,11 @@ mod tests {
     struct FailingInspector;
 
     impl ProcessInspector for FailingInspector {
-        fn worktree_in_use(&self, _worktree: &Path, _timeout: Duration) -> Result<bool, String> {
+        fn worktree_users(
+            &self,
+            _worktree: &Path,
+            _timeout: Duration,
+        ) -> Result<BTreeSet<u32>, String> {
             Err("unavailable".to_owned())
         }
     }
@@ -615,6 +676,7 @@ mod tests {
             &candidate,
             true,
             Duration::from_secs(2),
+            &BTreeSet::new(),
             &FailingInspector,
         )
         .unwrap_err();

@@ -11,13 +11,24 @@ pub mod paths;
 pub mod schedule;
 pub mod state;
 
-use std::{collections::BTreeMap, io::Write, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::Write,
+    path::PathBuf,
+    time::Duration,
+};
 
-use cleanup::{BranchOutcome, check_candidate, remove_worktree};
+use cleanup::{
+    BranchOutcome, SafetyRefusal, check_candidate, check_candidate_ignoring_processes,
+    remove_worktree,
+};
 use cli::{Cli, Command};
 use config::Config;
 use discovery::{DiscoveryIssueKind, discover};
-use herdr::{CandidateStatus, cleanup_removed, inspect_candidate};
+use herdr::{
+    CandidateStatus, StaleWorkspaceStatus, inspect_candidate, inspect_stale_workspaces,
+    retire_candidate,
+};
 use inspection::{
     RepositoryInspectionOutcome, WorktreeClassification, WorktreeInspection, inspect_repository,
 };
@@ -120,28 +131,39 @@ pub fn run_with_paths(
             .get(&repository_key)
             .map(|repository| &repository.last_classifications);
         let mut current_classifications = BTreeMap::new();
+        let inventory_paths: BTreeSet<_> = inspection
+            .worktrees
+            .iter()
+            .map(|worktree| worktree.path.clone())
+            .collect();
 
         for worktree in inspection.worktrees {
             let decision =
                 decide_worktree(&repository.path, &worktree, &config, apply, &mut summary);
-            let classification_changed = record_classification(
+            write_worktree_decision(
+                output,
+                &repository.path,
+                worktree.path,
+                &decision,
                 previous_classifications,
                 &mut current_classifications,
-                &worktree.path,
-                &decision,
-            );
+            )?;
+        }
 
-            write_event(
+        for (path, decision) in reconcile_stale_herdr_workspaces(
+            &repository.git_common_directory,
+            &inventory_paths,
+            &config,
+            apply,
+            &mut summary,
+        ) {
+            write_worktree_decision(
                 output,
-                &Event::Worktree {
-                    schema_version: output::OUTPUT_SCHEMA_VERSION,
-                    repository: repository.path.clone(),
-                    path: worktree.path,
-                    outcome: decision.outcome,
-                    reason_code: decision.reason_code,
-                    classification_changed,
-                    message: decision.message.as_deref(),
-                },
+                &repository.path,
+                path,
+                &decision,
+                previous_classifications,
+                &mut current_classifications,
             )?;
         }
 
@@ -151,7 +173,19 @@ pub fn run_with_paths(
             .or_default()
             .last_classifications = current_classifications;
     }
-    for issue in &discovery.issues {
+    write_discovery_issues(output, &discovery.issues)?;
+
+    state.save(&paths.state_file)?;
+    write_event(output, &Event::summary(&summary))?;
+    output.flush()?;
+    Ok(summary)
+}
+
+fn write_discovery_issues(
+    output: &mut impl Write,
+    issues: &[discovery::DiscoveryIssue],
+) -> std::io::Result<()> {
+    for issue in issues {
         write_event(
             output,
             &Event::DiscoveryFailure {
@@ -162,17 +196,152 @@ pub fn run_with_paths(
             },
         )?;
     }
-
-    state.save(&paths.state_file)?;
-    write_event(output, &Event::summary(&summary))?;
-    output.flush()?;
-    Ok(summary)
+    Ok(())
 }
 
 struct WorktreeDecision {
     outcome: WorktreeOutcome,
     reason_code: ReasonCode,
     message: Option<String>,
+}
+
+fn write_worktree_decision(
+    output: &mut impl Write,
+    repository: &std::path::Path,
+    path: PathBuf,
+    decision: &WorktreeDecision,
+    previous: Option<&BTreeMap<String, ClassificationState>>,
+    current: &mut BTreeMap<String, ClassificationState>,
+) -> std::io::Result<()> {
+    let classification_changed = record_classification(previous, current, &path, decision);
+    write_event(
+        output,
+        &Event::Worktree {
+            schema_version: output::OUTPUT_SCHEMA_VERSION,
+            repository: repository.to_path_buf(),
+            path,
+            outcome: decision.outcome,
+            reason_code: decision.reason_code,
+            classification_changed,
+            message: decision.message.as_deref(),
+        },
+    )
+}
+
+fn reconcile_stale_herdr_workspaces(
+    git_common_directory: &std::path::Path,
+    inventory_paths: &BTreeSet<PathBuf>,
+    config: &Config,
+    apply: bool,
+    summary: &mut Summary,
+) -> Vec<(PathBuf, WorktreeDecision)> {
+    let timeout = Duration::from_secs(config.fetch_timeout_seconds);
+    let stale = match inspect_stale_workspaces(git_common_directory, inventory_paths, timeout) {
+        Ok(StaleWorkspaceStatus::Unavailable) => return Vec::new(),
+        Ok(StaleWorkspaceStatus::Inspected(stale)) => stale,
+        Err(_) => {
+            summary.operational_failures += 1;
+            return Vec::new();
+        }
+    };
+
+    summary.worktrees_inspected += stale.len() as u64;
+    stale
+        .into_iter()
+        .map(|workspace| {
+            let path = workspace.checkout_path;
+            let decision = match workspace.status {
+                CandidateStatus::Clear(_coordination) if !apply => WorktreeDecision {
+                    outcome: WorktreeOutcome::Candidate,
+                    reason_code: ReasonCode::HerdrStaleWorkspacePending,
+                    message: Some("stale idle Herdr workspace is pending retirement".to_owned()),
+                },
+                CandidateStatus::Clear(coordination) => retire_stale_workspace(
+                    git_common_directory,
+                    inventory_paths,
+                    &path,
+                    &coordination,
+                    timeout,
+                    summary,
+                ),
+                CandidateStatus::FocusedPane { pane_id } => WorktreeDecision {
+                    outcome: WorktreeOutcome::Refused,
+                    reason_code: ReasonCode::HerdrFocusedPane,
+                    message: Some(format!(
+                        "stale Herdr workspace contains focused pane {pane_id}"
+                    )),
+                },
+                CandidateStatus::ActiveAgent { pane_id } => WorktreeDecision {
+                    outcome: WorktreeOutcome::Refused,
+                    reason_code: ReasonCode::HerdrActiveAgent,
+                    message: Some(format!(
+                        "stale Herdr workspace contains active pane {pane_id}"
+                    )),
+                },
+                CandidateStatus::Unavailable => unreachable!("nested stale status unavailable"),
+            };
+            update_worktree_summary(&decision, summary);
+            (path, decision)
+        })
+        .collect()
+}
+
+fn retire_stale_workspace(
+    git_common_directory: &std::path::Path,
+    inventory_paths: &BTreeSet<PathBuf>,
+    checkout_path: &std::path::Path,
+    coordination: &herdr::Coordination,
+    timeout: Duration,
+    summary: &mut Summary,
+) -> WorktreeDecision {
+    if let Err(error) = retire_candidate(coordination, timeout) {
+        summary.operational_failures += 1;
+        return WorktreeDecision {
+            outcome: WorktreeOutcome::Refused,
+            reason_code: ReasonCode::HerdrStaleWorkspaceFailed,
+            message: Some(error.to_string()),
+        };
+    }
+
+    match inspect_stale_workspaces(git_common_directory, inventory_paths, timeout) {
+        Ok(StaleWorkspaceStatus::Inspected(stale))
+            if !stale
+                .iter()
+                .any(|workspace| workspace.checkout_path == checkout_path) =>
+        {
+            WorktreeDecision {
+                outcome: WorktreeOutcome::Removed,
+                reason_code: ReasonCode::HerdrStaleWorkspaceRetired,
+                message: Some("retired stale idle Herdr workspace".to_owned()),
+            }
+        }
+        Ok(StaleWorkspaceStatus::Inspected(_)) => {
+            summary.operational_failures += 1;
+            WorktreeDecision {
+                outcome: WorktreeOutcome::Refused,
+                reason_code: ReasonCode::HerdrStaleWorkspaceFailed,
+                message: Some("stale Herdr workspace remained after close".to_owned()),
+            }
+        }
+        Ok(StaleWorkspaceStatus::Unavailable) | Err(_) => {
+            summary.operational_failures += 1;
+            WorktreeDecision {
+                outcome: WorktreeOutcome::Refused,
+                reason_code: ReasonCode::HerdrStaleWorkspaceFailed,
+                message: Some("could not verify stale Herdr workspace retirement".to_owned()),
+            }
+        }
+    }
+}
+
+fn update_worktree_summary(decision: &WorktreeDecision, summary: &mut Summary) {
+    match decision.outcome {
+        WorktreeOutcome::Candidate => summary.candidates += 1,
+        WorktreeOutcome::Refused => summary.refusals += 1,
+        WorktreeOutcome::Malformed => summary.malformed_states += 1,
+        WorktreeOutcome::Removed => summary.removals += 1,
+        WorktreeOutcome::Retained | WorktreeOutcome::Skipped => {}
+    }
 }
 
 fn decide_worktree(
@@ -182,96 +351,207 @@ fn decide_worktree(
     apply: bool,
     summary: &mut Summary,
 ) -> WorktreeDecision {
-    let (mut outcome, mut reason_code) = worktree_result(worktree.classification);
-    let mut message = None;
+    let (outcome, reason_code) = worktree_result(worktree.classification);
+    let mut decision = WorktreeDecision {
+        outcome,
+        reason_code,
+        message: None,
+    };
     summary.worktrees_inspected += 1;
 
-    if outcome == WorktreeOutcome::Candidate {
+    if decision.outcome == WorktreeOutcome::Candidate {
         let timeout = Duration::from_secs(config.fetch_timeout_seconds);
-        let coordination =
-            match check_candidate(repository, worktree, config.check_processes, timeout) {
-                Ok(()) => match inspect_candidate(&worktree.path, timeout) {
-                    Ok(CandidateStatus::Unavailable) => Some(None),
-                    Ok(CandidateStatus::Clear(coordination)) => Some(Some(coordination)),
-                    Ok(CandidateStatus::FocusedPane { pane_id }) => {
-                        outcome = WorktreeOutcome::Refused;
-                        reason_code = ReasonCode::HerdrFocusedPane;
-                        message = Some(format!("Herdr pane {pane_id} is focused in the worktree"));
-                        None
-                    }
-                    Ok(CandidateStatus::ActiveAgent { pane_id }) => {
-                        outcome = WorktreeOutcome::Refused;
-                        reason_code = ReasonCode::HerdrActiveAgent;
-                        message = Some(format!("Herdr pane {pane_id} contains an active agent"));
-                        None
-                    }
-                    Err(error) => {
-                        outcome = WorktreeOutcome::Refused;
-                        reason_code = ReasonCode::HerdrInspectionFailed;
-                        message = Some(error.to_string());
-                        summary.operational_failures += 1;
-                        None
-                    }
-                },
-                Err(refusal) => {
-                    outcome = WorktreeOutcome::Refused;
-                    reason_code = refusal.reason_code;
-                    message = Some(refusal.message);
-                    if refusal.operational_failure {
-                        summary.operational_failures += 1;
-                    }
-                    None
-                }
-            };
-
-        if apply && let Some(coordination) = coordination {
-            match remove_worktree(repository, &worktree.path, timeout) {
-                Ok(result) => {
-                    outcome = WorktreeOutcome::Removed;
-                    reason_code = branch_outcome_reason(result.branch_outcome);
-                    if result.branch_outcome == BranchOutcome::RetainedFailed {
-                        summary.operational_failures += 1;
-                    }
-                    message = result
-                        .branch_checked_out_at
-                        .map(|path| format!("branch is also checked out at {}", path.display()));
-
-                    if let Some(coordination) = coordination
-                        && let Err(error) = cleanup_removed(&coordination, timeout)
-                    {
-                        reason_code = ReasonCode::HerdrCleanupFailed;
-                        let cleanup_message = format!(
-                            "Git worktree removal completed ({:?}); {error}",
-                            result.branch_outcome
-                        );
-                        message = Some(match message {
-                            Some(existing) => format!("{existing}; {cleanup_message}"),
-                            None => cleanup_message,
-                        });
-                        summary.operational_failures += 1;
-                    }
-                }
-                Err(error) => {
-                    outcome = WorktreeOutcome::Refused;
-                    reason_code = ReasonCode::RemovalFailed;
-                    message = Some(error.to_string());
-                    summary.operational_failures += 1;
-                }
-            }
+        if prepare_candidate(
+            repository,
+            worktree,
+            config,
+            apply,
+            timeout,
+            &mut decision,
+            summary,
+        ) {
+            apply_removal(repository, worktree, timeout, &mut decision, summary);
         }
     }
 
-    match outcome {
-        WorktreeOutcome::Candidate => summary.candidates += 1,
-        WorktreeOutcome::Refused => summary.refusals += 1,
-        WorktreeOutcome::Malformed => summary.malformed_states += 1,
-        WorktreeOutcome::Removed => summary.removals += 1,
-        WorktreeOutcome::Retained | WorktreeOutcome::Skipped => {}
+    update_worktree_summary(&decision, summary);
+    decision
+}
+
+fn prepare_candidate(
+    repository: &std::path::Path,
+    worktree: &WorktreeInspection,
+    config: &Config,
+    apply: bool,
+    timeout: Duration,
+    decision: &mut WorktreeDecision,
+    summary: &mut Summary,
+) -> bool {
+    if let Err(refusal) = check_candidate(repository, worktree, false, timeout) {
+        apply_safety_refusal(refusal, decision, summary);
+        return false;
     }
-    WorktreeDecision {
-        outcome,
-        reason_code,
-        message,
+
+    match inspect_candidate(&worktree.path, timeout) {
+        Ok(CandidateStatus::Unavailable) => {
+            match check_candidate(repository, worktree, config.check_processes, timeout) {
+                Ok(()) => apply,
+                Err(refusal) => {
+                    apply_safety_refusal(refusal, decision, summary);
+                    false
+                }
+            }
+        }
+        Ok(CandidateStatus::Clear(coordination)) => {
+            if let Err(refusal) = check_candidate_ignoring_processes(
+                repository,
+                worktree,
+                config.check_processes,
+                timeout,
+                coordination.attributed_processes(),
+            ) {
+                apply_safety_refusal(refusal, decision, summary);
+                return false;
+            }
+            if !apply {
+                if coordination.requires_retirement() {
+                    decision.reason_code = ReasonCode::HerdrCoordinationPending;
+                    decision.message = Some(format!(
+                        "{} idle Herdr workspace(s) must be retired before removal",
+                        coordination.workspace_count()
+                    ));
+                }
+                return false;
+            }
+            if coordination.requires_retirement()
+                && let Err(error) = retire_candidate(&coordination, timeout)
+            {
+                decision.outcome = WorktreeOutcome::Refused;
+                decision.reason_code = ReasonCode::HerdrRetirementFailed;
+                decision.message = Some(error.to_string());
+                summary.operational_failures += 1;
+                return false;
+            }
+            recheck_after_coordination(repository, worktree, config, timeout, decision, summary)
+        }
+        Ok(status) => {
+            apply_herdr_veto(status, decision);
+            false
+        }
+        Err(error) => {
+            decision.outcome = WorktreeOutcome::Refused;
+            decision.reason_code = ReasonCode::HerdrInspectionFailed;
+            decision.message = Some(error.to_string());
+            summary.operational_failures += 1;
+            false
+        }
+    }
+}
+
+fn apply_removal(
+    repository: &std::path::Path,
+    worktree: &WorktreeInspection,
+    timeout: Duration,
+    decision: &mut WorktreeDecision,
+    summary: &mut Summary,
+) {
+    match remove_worktree(repository, &worktree.path, timeout) {
+        Ok(result) => {
+            decision.outcome = WorktreeOutcome::Removed;
+            decision.reason_code = branch_outcome_reason(result.branch_outcome);
+            if result.branch_outcome == BranchOutcome::RetainedFailed {
+                summary.operational_failures += 1;
+            }
+            decision.message = result
+                .branch_checked_out_at
+                .map(|path| format!("branch is also checked out at {}", path.display()));
+        }
+        Err(error) => {
+            decision.outcome = WorktreeOutcome::Refused;
+            decision.reason_code = ReasonCode::RemovalFailed;
+            decision.message = Some(error.to_string());
+            summary.operational_failures += 1;
+        }
+    }
+}
+
+fn recheck_after_coordination(
+    repository: &std::path::Path,
+    worktree: &WorktreeInspection,
+    config: &Config,
+    timeout: Duration,
+    decision: &mut WorktreeDecision,
+    summary: &mut Summary,
+) -> bool {
+    match inspect_candidate(&worktree.path, timeout) {
+        Ok(CandidateStatus::Clear(coordination)) if !coordination.requires_retirement() => {
+            match check_candidate(repository, worktree, config.check_processes, timeout) {
+                Ok(()) => true,
+                Err(refusal) => {
+                    apply_safety_refusal(refusal, decision, summary);
+                    false
+                }
+            }
+        }
+        Ok(CandidateStatus::Clear(coordination)) => {
+            decision.outcome = WorktreeOutcome::Refused;
+            decision.reason_code = ReasonCode::HerdrRetirementFailed;
+            decision.message = Some(format!(
+                "{} candidate Herdr workspace(s) remain after retirement",
+                coordination.workspace_count()
+            ));
+            summary.operational_failures += 1;
+            false
+        }
+        Ok(CandidateStatus::Unavailable) => {
+            decision.outcome = WorktreeOutcome::Refused;
+            decision.reason_code = ReasonCode::HerdrInspectionFailed;
+            decision.message =
+                Some("Herdr became unavailable while rechecking retired workspaces".to_owned());
+            summary.operational_failures += 1;
+            false
+        }
+        Ok(status) => {
+            apply_herdr_veto(status, decision);
+            false
+        }
+        Err(error) => {
+            decision.outcome = WorktreeOutcome::Refused;
+            decision.reason_code = ReasonCode::HerdrInspectionFailed;
+            decision.message = Some(error.to_string());
+            summary.operational_failures += 1;
+            false
+        }
+    }
+}
+
+fn apply_herdr_veto(status: CandidateStatus, decision: &mut WorktreeDecision) {
+    decision.outcome = WorktreeOutcome::Refused;
+    match status {
+        CandidateStatus::FocusedPane { pane_id } => {
+            decision.reason_code = ReasonCode::HerdrFocusedPane;
+            decision.message = Some(format!("Herdr pane {pane_id} is focused in the worktree"));
+        }
+        CandidateStatus::ActiveAgent { pane_id } => {
+            decision.reason_code = ReasonCode::HerdrActiveAgent;
+            decision.message = Some(format!("Herdr pane {pane_id} contains an active agent"));
+        }
+        CandidateStatus::Unavailable | CandidateStatus::Clear(_) => {
+            unreachable!("non-veto status passed to apply_herdr_veto")
+        }
+    }
+}
+
+fn apply_safety_refusal(
+    refusal: SafetyRefusal,
+    decision: &mut WorktreeDecision,
+    summary: &mut Summary,
+) {
+    decision.outcome = WorktreeOutcome::Refused;
+    decision.reason_code = refusal.reason_code;
+    decision.message = Some(refusal.message);
+    if refusal.operational_failure {
+        summary.operational_failures += 1;
     }
 }
 
