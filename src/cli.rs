@@ -27,11 +27,19 @@ pub enum Command {
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Subcommand)]
 pub enum ScheduleCommand {
     /// Install or refresh the platform schedule.
-    Install,
-    /// Report whether the platform schedule is installed and loaded.
+    Install {
+        /// Allow prune mode when one or more repositories fail credential preflight.
+        #[arg(long)]
+        allow_degraded_preflight: bool,
+    },
+    /// Report installed settings, command drift, and repository preflight failures.
     Status,
     /// Edit validated settings, then regenerate and reload the schedule.
-    Edit,
+    Edit {
+        /// Allow prune mode when one or more repositories fail credential preflight.
+        #[arg(long)]
+        allow_degraded_preflight: bool,
+    },
     /// Stop and remove the platform schedule.
     Uninstall,
 }
@@ -76,9 +84,19 @@ mod tests {
     #[test]
     fn parses_schedule_commands() {
         for (name, expected) in [
-            ("install", ScheduleCommand::Install),
+            (
+                "install",
+                ScheduleCommand::Install {
+                    allow_degraded_preflight: false,
+                },
+            ),
             ("status", ScheduleCommand::Status),
-            ("edit", ScheduleCommand::Edit),
+            (
+                "edit",
+                ScheduleCommand::Edit {
+                    allow_degraded_preflight: false,
+                },
+            ),
             ("uninstall", ScheduleCommand::Uninstall),
         ] {
             assert_eq!(
@@ -88,5 +106,19 @@ mod tests {
                 Command::Schedule { command: expected }
             );
         }
+    }
+
+    #[test]
+    fn parses_degraded_preflight_acknowledgement() {
+        assert_eq!(
+            Cli::try_parse_from(["lop", "schedule", "install", "--allow-degraded-preflight",])
+                .unwrap()
+                .command,
+            Command::Schedule {
+                command: ScheduleCommand::Install {
+                    allow_degraded_preflight: true,
+                },
+            }
+        );
     }
 }

@@ -7,7 +7,8 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let mut output = io::BufWriter::new(io::stdout().lock());
     if let Command::Schedule { command } = &cli.command {
-        return match lop::schedule::run(*command, &mut output) {
+        let mut warnings = io::BufWriter::new(io::stderr().lock());
+        return match lop::schedule::run(*command, &mut output, &mut warnings) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("lop: {error}");

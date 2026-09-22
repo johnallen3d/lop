@@ -152,6 +152,68 @@ fn successful_cleanup_removes_checkout_and_integrated_local_branch() {
 }
 
 #[test]
+fn failed_repository_is_untouched_while_healthy_repository_is_pruned() {
+    let fixture = Fixture::new();
+    let healthy_worktree = fixture.integrated_worktree("healthy-finished");
+    let sources = fixture.repository.parent().unwrap();
+    let broken_repository = sources.join("broken");
+    git(
+        sources,
+        &[
+            "init",
+            "--quiet",
+            "--initial-branch=main",
+            path(&broken_repository),
+        ],
+    );
+    git(&broken_repository, &["config", "user.name", "Lop Test"]);
+    git(
+        &broken_repository,
+        &["config", "user.email", "lop@example.invalid"],
+    );
+    git(&broken_repository, &["config", "commit.gpgsign", "false"]);
+    fs::write(broken_repository.join("base.txt"), "base\n").unwrap();
+    git(&broken_repository, &["add", "base.txt"]);
+    git(&broken_repository, &["commit", "--quiet", "-m", "base"]);
+    git(
+        &broken_repository,
+        &[
+            "remote",
+            "add",
+            "origin",
+            path(&sources.join("missing.git")),
+        ],
+    );
+    let failed_worktree = fixture.directory.path().join("worktrees/failed-repository");
+    git(
+        &broken_repository,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "candidate",
+            path(&failed_worktree),
+            "main",
+        ],
+    );
+    let failed_worktree = fs::canonicalize(failed_worktree).unwrap();
+
+    let output = fixture.prune();
+
+    assert!(!output.status.success());
+    assert!(!healthy_worktree.exists());
+    assert!(failed_worktree.exists());
+    assert!(ref_exists(&broken_repository, "refs/heads/candidate"));
+    let records = records(&output);
+    let failed_record = worktree_record(&records, &failed_worktree);
+    assert_eq!(failed_record["outcome"], "skipped");
+    assert_eq!(failed_record["reason_code"], "fetch_failed");
+    assert_eq!(records.last().unwrap()["repositories_scanned"], 2);
+    assert_eq!(records.last().unwrap()["removals"], 1);
+}
+
+#[test]
 fn dirty_staged_and_untracked_files_survive_cleanup_attempts() {
     let fixture = Fixture::new();
     let modified = fixture.integrated_worktree("modified");

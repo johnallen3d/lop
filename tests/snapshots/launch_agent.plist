@@ -19,6 +19,8 @@
         <string>0</string>
         <key>GIT_SSH_COMMAND</key>
         <string>/usr/bin/ssh -o BatchMode=yes</string>
+        <key>HOME</key>
+        <string>/Users/test</string>
         <key>PATH</key>
         <string>/bin:/nix/store/git/bin:/nix/store/lop/bin:/nix/store/worktrunk/bin:/usr/bin</string>
         <key>SSH_AUTH_SOCK</key>

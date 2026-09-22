@@ -47,11 +47,19 @@ pub enum ScheduleError {
     MissingExecutable { name: &'static str },
     #[error("cannot schedule Lop because repository discovery failed: {0}")]
     Discovery(String),
-    #[error("noninteractive credential preflight failed for {repository}: {message}")]
-    CredentialPreflight {
-        repository: PathBuf,
-        message: String,
+    #[error("failed to read installed LaunchAgent at {path}: {source}")]
+    ReadLaunchAgent {
+        path: PathBuf,
+        source: std::io::Error,
     },
+    #[error("schedule runtime paths are not writable: {0}")]
+    RuntimePaths(String),
+    #[error(
+        "prune mode has degraded repository preflight; rerun with --allow-degraded-preflight after reviewing every warning"
+    )]
+    DegradedPruneRequiresAcknowledgement,
+    #[error("schedule update failed: {operation}; rollback also failed: {rollback}")]
+    TransactionRollback { operation: String, rollback: String },
     #[error("SSH_AUTH_SOCK is required for SSH remotes but is not set")]
     MissingSshAgent,
     #[error("SSH_AUTH_SOCK {0:?} is not a usable Unix socket")]
@@ -179,6 +187,7 @@ struct Programs {
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct ScheduleEnvironment {
     programs: Programs,
+    home: PathBuf,
     ssh_auth_sock: Option<PathBuf>,
 }
 
@@ -187,21 +196,50 @@ struct LaunchAgent {
     contents: String,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct PreflightFailure {
+    repository: PathBuf,
+    message: String,
+}
+
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
+struct PreflightReport {
+    failures: Vec<PreflightFailure>,
+}
+
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
+struct InstalledSchedule {
+    arguments: Option<Vec<String>>,
+    interval_seconds: Option<u64>,
+    parse_errors: Vec<String>,
+}
+
 /// Runs a scheduling command independently of the cleanup pipeline.
+///
+/// Warnings about repositories that cannot be fetched noninteractively are
+/// written separately from normal status output.
 ///
 /// # Errors
 ///
 /// Returns an actionable error for unsupported platforms, invalid settings,
 /// missing prerequisites, credential failures, or platform service failures.
-pub fn run(command: ScheduleCommand, output: &mut impl Write) -> Result<(), ScheduleError> {
+pub fn run(
+    command: ScheduleCommand,
+    output: &mut impl Write,
+    warnings: &mut impl Write,
+) -> Result<(), ScheduleError> {
     ensure_supported_platform(env::consts::OS)?;
 
     let paths = SchedulePaths::from_env()?;
     let backend = MacOsBackend::system(&paths)?;
     match command {
-        ScheduleCommand::Install => install(&paths, &backend, output),
+        ScheduleCommand::Install {
+            allow_degraded_preflight,
+        } => install(&paths, &backend, allow_degraded_preflight, output, warnings),
         ScheduleCommand::Status => status(&paths, &backend, output),
-        ScheduleCommand::Edit => edit(&paths, &backend, output),
+        ScheduleCommand::Edit {
+            allow_degraded_preflight,
+        } => edit(&paths, &backend, allow_degraded_preflight, output, warnings),
         ScheduleCommand::Uninstall => uninstall(&paths, &backend, output),
     }
 }
@@ -217,7 +255,9 @@ fn ensure_supported_platform(platform: &'static str) -> Result<(), ScheduleError
 fn install(
     paths: &SchedulePaths,
     backend: &MacOsBackend,
+    allow_degraded_preflight: bool,
     output: &mut impl Write,
+    warnings: &mut impl Write,
 ) -> Result<(), ScheduleError> {
     let settings = if paths.settings.exists() {
         load_settings(&paths.settings)?
@@ -225,33 +265,24 @@ fn install(
         ScheduleSettings::default()
     };
     let environment = prepare_environment()?;
-    preflight_credentials(&environment)?;
+    let preflight = preflight_credentials(&environment)?;
+    write_preflight_warnings(&preflight, warnings)?;
+    authorize_degraded_prune(&settings, &preflight, allow_degraded_preflight)?;
     let agent = generate_launch_agent(&settings, &environment, paths);
 
-    let previous_settings = fs::read(&paths.settings).ok();
-    write_atomic(&paths.settings, settings.encode().as_bytes(), 0o600)?;
-    if let Err(error) = backend.install(&agent.contents) {
-        match previous_settings {
-            Some(contents) => {
-                let _ = write_atomic(&paths.settings, &contents, 0o600);
-            }
-            None => {
-                let _ = fs::remove_file(&paths.settings);
-            }
-        }
-        return Err(error);
-    }
-    writeln!(
+    backend.install_transactionally(
+        &agent.contents,
+        &paths.settings,
+        settings.encode().as_bytes(),
+    )?;
+    write_output(
         output,
-        "installed {LABEL} in {} mode every {} seconds",
-        settings.mode.label(),
-        settings.interval_seconds
+        format_args!(
+            "installed {LABEL} in {} mode every {} seconds",
+            settings.mode.label(),
+            settings.interval_seconds
+        ),
     )
-    .map_err(|source| ScheduleError::Write {
-        path: PathBuf::from("stdout"),
-        source,
-    })?;
-    Ok(())
 }
 
 fn status(
@@ -260,11 +291,7 @@ fn status(
     output: &mut impl Write,
 ) -> Result<(), ScheduleError> {
     if !paths.launch_agent.exists() {
-        writeln!(output, "{LABEL} is not installed").map_err(|source| ScheduleError::Write {
-            path: PathBuf::from("stdout"),
-            source,
-        })?;
-        return Ok(());
+        return write_output(output, format_args!("{LABEL} is not installed"));
     }
     if !paths.settings.exists() {
         return Err(ScheduleError::InvalidSettings {
@@ -273,26 +300,77 @@ fn status(
                 .to_owned(),
         });
     }
+
     let settings = load_settings(&paths.settings)?;
+    let environment = prepare_environment()?;
+    let preflight = preflight_credentials(&environment)?;
+    let installed = inspect_installed_schedule(&paths.launch_agent)?;
+    let drift = schedule_drift(&settings, &environment, &installed);
     let loaded = backend.is_loaded()?;
-    writeln!(
+
+    write_output(
         output,
-        "{LABEL} is installed and {}; mode={}, interval_seconds={}",
-        if loaded { "loaded" } else { "not loaded" },
-        settings.mode.label(),
-        settings.interval_seconds
-    )
-    .map_err(|source| ScheduleError::Write {
-        path: PathBuf::from("stdout"),
-        source,
-    })?;
+        format_args!(
+            "{LABEL} is installed and {}",
+            if loaded { "loaded" } else { "not loaded" }
+        ),
+    )?;
+    write_output(
+        output,
+        format_args!(
+            "configured: mode={}, interval_seconds={}",
+            settings.mode.label(),
+            settings.interval_seconds
+        ),
+    )?;
+    write_output(
+        output,
+        format_args!(
+            "installed: command={}, interval_seconds={}",
+            installed_command_label(installed.arguments.as_deref()),
+            installed
+                .interval_seconds
+                .map_or_else(|| "unknown".to_owned(), |value| value.to_string())
+        ),
+    )?;
+    write_output(
+        output,
+        format_args!(
+            "drift: {}",
+            if drift.is_empty() {
+                "none".to_owned()
+            } else {
+                drift.join("; ")
+            }
+        ),
+    )?;
+    write_output(
+        output,
+        format_args!(
+            "degraded_preflight: {} repositor{}",
+            preflight.failures.len(),
+            if preflight.failures.len() == 1 {
+                "y"
+            } else {
+                "ies"
+            }
+        ),
+    )?;
+    for failure in &preflight.failures {
+        write_output(
+            output,
+            format_args!("  {}: {}", failure.repository.display(), failure.message),
+        )?;
+    }
     Ok(())
 }
 
 fn edit(
     paths: &SchedulePaths,
     backend: &MacOsBackend,
+    allow_degraded_preflight: bool,
     output: &mut impl Write,
+    warnings: &mut impl Write,
 ) -> Result<(), ScheduleError> {
     if !paths.settings.exists() || !paths.launch_agent.exists() {
         return Err(ScheduleError::NotInstalled);
@@ -339,25 +417,24 @@ fn edit(
     let _ = fs::remove_file(&edit_path);
     let edited = edited?;
     let environment = prepare_environment()?;
-    preflight_credentials(&environment)?;
+    let preflight = preflight_credentials(&environment)?;
+    write_preflight_warnings(&preflight, warnings)?;
+    authorize_degraded_prune(&edited, &preflight, allow_degraded_preflight)?;
     let agent = generate_launch_agent(&edited, &environment, paths);
 
-    write_atomic(&paths.settings, edited.encode().as_bytes(), 0o600)?;
-    if let Err(error) = backend.install(&agent.contents) {
-        let _ = write_atomic(&paths.settings, current.encode().as_bytes(), 0o600);
-        return Err(error);
-    }
-    writeln!(
+    backend.install_transactionally(
+        &agent.contents,
+        &paths.settings,
+        edited.encode().as_bytes(),
+    )?;
+    write_output(
         output,
-        "updated {LABEL}; mode={}, interval_seconds={}",
-        edited.mode.label(),
-        edited.interval_seconds
+        format_args!(
+            "updated {LABEL}; mode={}, interval_seconds={}",
+            edited.mode.label(),
+            edited.interval_seconds
+        ),
     )
-    .map_err(|source| ScheduleError::Write {
-        path: PathBuf::from("stdout"),
-        source,
-    })?;
-    Ok(())
 }
 
 fn uninstall(
@@ -371,20 +448,27 @@ fn uninstall(
         backend.uninstall()?;
     }
     remove_if_exists(&paths.settings)?;
-    writeln!(
+    write_output(
         output,
-        "{LABEL} {}",
-        if was_installed {
-            "was uninstalled"
-        } else {
-            "is already uninstalled"
-        }
+        format_args!(
+            "{LABEL} {}",
+            if was_installed {
+                "was uninstalled"
+            } else {
+                "is already uninstalled"
+            }
+        ),
     )
-    .map_err(|source| ScheduleError::Write {
+}
+
+fn write_output(
+    output: &mut impl Write,
+    arguments: std::fmt::Arguments<'_>,
+) -> Result<(), ScheduleError> {
+    writeln!(output, "{arguments}").map_err(|source| ScheduleError::Write {
         path: PathBuf::from("stdout"),
         source,
-    })?;
-    Ok(())
+    })
 }
 
 fn load_settings(path: &Path) -> Result<ScheduleSettings, ScheduleError> {
@@ -406,7 +490,120 @@ fn load_settings(path: &Path) -> Result<ScheduleSettings, ScheduleError> {
     Ok(settings)
 }
 
+fn inspect_installed_schedule(path: &Path) -> Result<InstalledSchedule, ScheduleError> {
+    let contents = fs::read_to_string(path).map_err(|source| ScheduleError::ReadLaunchAgent {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut installed = InstalledSchedule::default();
+    match plist_value_after_key(&contents, "ProgramArguments", "array") {
+        Some(arguments) => {
+            let strings = plist_strings(arguments);
+            if strings.is_empty() {
+                installed
+                    .parse_errors
+                    .push("ProgramArguments contains no strings".to_owned());
+            } else {
+                installed.arguments = Some(strings);
+            }
+        }
+        None => installed
+            .parse_errors
+            .push("ProgramArguments is missing or malformed".to_owned()),
+    }
+    match plist_value_after_key(&contents, "StartInterval", "integer") {
+        Some(value) => match value.trim().parse() {
+            Ok(value) => installed.interval_seconds = Some(value),
+            Err(error) => installed
+                .parse_errors
+                .push(format!("StartInterval is invalid: {error}")),
+        },
+        None => installed
+            .parse_errors
+            .push("StartInterval is missing or malformed".to_owned()),
+    }
+    Ok(installed)
+}
+
+fn plist_value_after_key<'a>(contents: &'a str, key: &str, element: &str) -> Option<&'a str> {
+    let key = format!("<key>{key}</key>");
+    let after_key = contents.split_once(&key)?.1;
+    let opening = format!("<{element}>");
+    let closing = format!("</{element}>");
+    let after_opening = after_key.split_once(&opening)?.1;
+    Some(after_opening.split_once(&closing)?.0)
+}
+
+fn plist_strings(contents: &str) -> Vec<String> {
+    let mut strings = Vec::new();
+    let mut remaining = contents;
+    while let Some((_, after_opening)) = remaining.split_once("<string>") {
+        let Some((value, after_closing)) = after_opening.split_once("</string>") else {
+            break;
+        };
+        strings.push(xml_unescape(value));
+        remaining = after_closing;
+    }
+    strings
+}
+
+fn xml_unescape(value: &str) -> String {
+    value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+fn installed_command_label(arguments: Option<&[String]>) -> String {
+    arguments.map_or_else(
+        || "unknown".to_owned(),
+        |arguments| {
+            arguments
+                .iter()
+                .map(|argument| format!("{argument:?}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        },
+    )
+}
+
+fn schedule_drift(
+    settings: &ScheduleSettings,
+    environment: &ScheduleEnvironment,
+    installed: &InstalledSchedule,
+) -> Vec<String> {
+    let mut drift = installed.parse_errors.clone();
+    let expected_arguments: &[&str] = match settings.mode {
+        ScheduleMode::Scan => &["scan"],
+        ScheduleMode::Prune => &["prune", "--yes"],
+    };
+    if let Some(arguments) = installed.arguments.as_deref() {
+        if arguments.first().map(String::as_str)
+            != Some(environment.programs.lop.to_string_lossy().as_ref())
+        {
+            drift.push("installed Lop executable differs from the current executable".to_owned());
+        }
+        let installed_arguments: Vec<_> = arguments.iter().skip(1).map(String::as_str).collect();
+        if installed_arguments != expected_arguments {
+            drift.push(format!(
+                "installed command does not match configured {} mode",
+                settings.mode.label()
+            ));
+        }
+    }
+    if installed.interval_seconds != Some(settings.interval_seconds) {
+        drift.push("installed interval does not match configured interval".to_owned());
+    }
+    drift
+}
+
 fn prepare_environment() -> Result<ScheduleEnvironment, ScheduleError> {
+    let home = env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or(ScheduleError::MissingHome)?;
     let lop = env::current_exe().map_err(|source| ScheduleError::Spawn {
         program: "current executable".to_owned(),
         source,
@@ -433,6 +630,7 @@ fn prepare_environment() -> Result<ScheduleEnvironment, ScheduleError> {
             worktrunk,
             path,
         },
+        home,
         ssh_auth_sock: env::var_os("SSH_AUTH_SOCK")
             .filter(|value| !value.is_empty())
             .map(PathBuf::from),
@@ -465,9 +663,12 @@ fn is_executable(path: &Path) -> bool {
     path.is_file()
 }
 
-fn preflight_credentials(environment: &ScheduleEnvironment) -> Result<(), ScheduleError> {
+fn preflight_credentials(
+    environment: &ScheduleEnvironment,
+) -> Result<PreflightReport, ScheduleError> {
     let app_paths = crate::paths::AppPaths::from_env()
         .map_err(|error| ScheduleError::Discovery(error.to_string()))?;
+    validate_runtime_paths(&app_paths)?;
     let config = Config::load(&app_paths.config_file)
         .map_err(|error| ScheduleError::Discovery(error.to_string()))?;
     let discovery = discover(&config.roots, config.scan_depth);
@@ -482,32 +683,97 @@ fn preflight_credentials(environment: &ScheduleEnvironment) -> Result<(), Schedu
         ));
     }
 
+    preflight_repositories(
+        environment,
+        &discovery.repositories,
+        Duration::from_secs(config.fetch_timeout_seconds),
+    )
+}
+
+fn validate_runtime_paths(paths: &crate::paths::AppPaths) -> Result<(), ScheduleError> {
+    let state_parent = paths.state_file.parent().ok_or_else(|| {
+        ScheduleError::RuntimePaths("state path has no parent directory".to_owned())
+    })?;
+    fs::create_dir_all(state_parent)
+        .map_err(|error| ScheduleError::RuntimePaths(error.to_string()))?;
+    let probe = state_parent.join(format!(
+        ".schedule-viability-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .map_err(|error| ScheduleError::RuntimePaths(error.to_string()))?;
+    fs::remove_file(&probe).map_err(|error| ScheduleError::RuntimePaths(error.to_string()))?;
+    let lock_existed = paths.lock_file.exists();
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&paths.lock_file)
+        .map_err(|error| ScheduleError::RuntimePaths(error.to_string()))?;
+    if !lock_existed {
+        fs::remove_file(&paths.lock_file)
+            .map_err(|error| ScheduleError::RuntimePaths(error.to_string()))?;
+    }
+    Ok(())
+}
+
+fn preflight_repositories(
+    environment: &ScheduleEnvironment,
+    repositories: &[crate::discovery::Repository],
+    timeout: Duration,
+) -> Result<PreflightReport, ScheduleError> {
+    let mut report = PreflightReport::default();
     let mut requires_ssh = false;
-    for repository in &discovery.repositories {
-        let remotes = command_output(
+
+    for repository in repositories {
+        let home = environment.home.to_string_lossy();
+        match command_output(
             &environment.programs.git,
             &["-C", &repository.path.to_string_lossy(), "remote", "-v"],
-            &[],
+            &[("HOME", &home), ("PATH", &environment.programs.path)],
             COMMAND_TIMEOUT,
-        )?;
-        if !remotes.status.success() {
-            return Err(ScheduleError::CredentialPreflight {
-                repository: repository.path.clone(),
-                message: stderr_message(&remotes.stderr),
-            });
+        ) {
+            Ok(remotes) if remotes.status.success() => {
+                requires_ssh |= String::from_utf8_lossy(&remotes.stdout)
+                    .lines()
+                    .any(remote_uses_ssh);
+            }
+            Ok(remotes) => append_preflight_failure(
+                &mut report,
+                &repository.path,
+                format!(
+                    "`git remote -v` failed: {}",
+                    stderr_message(&remotes.stderr)
+                ),
+            ),
+            Err(error) => append_preflight_failure(
+                &mut report,
+                &repository.path,
+                format!("could not inspect remotes: {error}"),
+            ),
         }
-        requires_ssh |= String::from_utf8_lossy(&remotes.stdout)
-            .lines()
-            .any(remote_uses_ssh);
     }
 
     if requires_ssh {
+        if !is_executable(Path::new("/usr/bin/ssh")) {
+            return Err(ScheduleError::MissingExecutable { name: "ssh" });
+        }
         validate_ssh_agent(environment.ssh_auth_sock.as_deref())?;
     } else if let Some(socket) = environment.ssh_auth_sock.as_deref() {
         validate_socket(socket)?;
     }
 
+    let home = environment.home.to_string_lossy();
     let mut variables = vec![
+        ("HOME", home.as_ref()),
         ("PATH", environment.programs.path.as_str()),
         ("GIT_TERMINAL_PROMPT", "0"),
         ("GIT_SSH_COMMAND", "/usr/bin/ssh -o BatchMode=yes"),
@@ -520,8 +786,8 @@ fn preflight_credentials(environment: &ScheduleEnvironment) -> Result<(), Schedu
         variables.push(("SSH_AUTH_SOCK", value));
     }
 
-    for repository in discovery.repositories {
-        let output = command_output(
+    for repository in repositories {
+        match command_output(
             &environment.programs.git,
             &[
                 "-C",
@@ -533,29 +799,93 @@ fn preflight_credentials(environment: &ScheduleEnvironment) -> Result<(), Schedu
                 "--no-recurse-submodules",
             ],
             &variables,
-            Duration::from_secs(config.fetch_timeout_seconds),
-        )?;
-        if !output.status.success() {
-            return Err(ScheduleError::CredentialPreflight {
-                repository: repository.path,
-                message: format!(
+            timeout,
+        ) {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => append_preflight_failure(
+                &mut report,
+                &repository.path,
+                format!(
                     "`git fetch --dry-run` failed with prompts disabled: {}",
                     stderr_message(&output.stderr)
                 ),
-            });
+            ),
+            Err(error) => append_preflight_failure(
+                &mut report,
+                &repository.path,
+                format!("`git fetch --dry-run` could not complete: {error}"),
+            ),
         }
     }
+
+    Ok(report)
+}
+
+fn append_preflight_failure(report: &mut PreflightReport, repository: &Path, message: String) {
+    if let Some(failure) = report
+        .failures
+        .iter_mut()
+        .find(|failure| failure.repository == repository)
+    {
+        failure.message.push_str("; ");
+        failure.message.push_str(&message);
+    } else {
+        report.failures.push(PreflightFailure {
+            repository: repository.to_path_buf(),
+            message,
+        });
+    }
+}
+
+fn write_preflight_warnings(
+    report: &PreflightReport,
+    warnings: &mut impl Write,
+) -> Result<(), ScheduleError> {
+    for failure in &report.failures {
+        writeln!(
+            warnings,
+            "warning: degraded preflight for {}: {} (scheduled runs will skip this repository fail-closed)",
+            failure.repository.display(),
+            failure.message
+        )
+        .map_err(|source| ScheduleError::Write {
+            path: PathBuf::from("stderr"),
+            source,
+        })?;
+    }
     Ok(())
+}
+
+fn authorize_degraded_prune(
+    settings: &ScheduleSettings,
+    report: &PreflightReport,
+    acknowledged: bool,
+) -> Result<(), ScheduleError> {
+    if settings.mode == ScheduleMode::Prune && !report.failures.is_empty() && !acknowledged {
+        Err(ScheduleError::DegradedPruneRequiresAcknowledgement)
+    } else {
+        Ok(())
+    }
 }
 
 fn remote_uses_ssh(line: &str) -> bool {
     let Some(url) = line.split_whitespace().nth(1) else {
         return false;
     };
-    url.starts_with("ssh://")
-        || (!url.contains("://")
-            && url.contains(':')
-            && url.split(':').next().is_some_and(|host| host.contains('@')))
+    if url.starts_with("ssh://") {
+        return true;
+    }
+    if url.contains("://")
+        || url.starts_with('/')
+        || url.starts_with("./")
+        || url.starts_with("../")
+    {
+        return false;
+    }
+    let Some((host, path)) = url.split_once(':') else {
+        return false;
+    };
+    !host.is_empty() && !path.is_empty() && !host.contains('/')
 }
 
 #[cfg(unix)]
@@ -628,11 +958,13 @@ fn generate_launch_agent(
         });
     let stdout = paths.log_directory.join("lop.out.log");
     let stderr = paths.log_directory.join("lop.err.log");
+    let home = environment.home.to_string_lossy();
 
     LaunchAgent {
         contents: format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n    <key>Label</key>\n    <string>{LABEL}</string>\n    <key>ProgramArguments</key>\n    <array>\n{argument_xml}    </array>\n    <key>RunAtLoad</key>\n    <true/>\n    <key>StartInterval</key>\n    <integer>{}</integer>\n    <key>EnvironmentVariables</key>\n    <dict>\n        <key>GIT_TERMINAL_PROMPT</key>\n        <string>0</string>\n        <key>GIT_SSH_COMMAND</key>\n        <string>/usr/bin/ssh -o BatchMode=yes</string>\n        <key>PATH</key>\n        <string>{}</string>\n{ssh_auth_sock}    </dict>\n    <key>StandardOutPath</key>\n    <string>{}</string>\n    <key>StandardErrorPath</key>\n    <string>{}</string>\n</dict>\n</plist>\n",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n    <key>Label</key>\n    <string>{LABEL}</string>\n    <key>ProgramArguments</key>\n    <array>\n{argument_xml}    </array>\n    <key>RunAtLoad</key>\n    <true/>\n    <key>StartInterval</key>\n    <integer>{}</integer>\n    <key>EnvironmentVariables</key>\n    <dict>\n        <key>GIT_TERMINAL_PROMPT</key>\n        <string>0</string>\n        <key>GIT_SSH_COMMAND</key>\n        <string>/usr/bin/ssh -o BatchMode=yes</string>\n        <key>HOME</key>\n        <string>{}</string>\n        <key>PATH</key>\n        <string>{}</string>\n{ssh_auth_sock}    </dict>\n    <key>StandardOutPath</key>\n    <string>{}</string>\n    <key>StandardErrorPath</key>\n    <string>{}</string>\n</dict>\n</plist>\n",
             settings.interval_seconds,
+            xml_escape(&home),
             xml_escape(&environment.programs.path),
             xml_escape(&stdout.to_string_lossy()),
             xml_escape(&stderr.to_string_lossy())
@@ -681,8 +1013,14 @@ impl MacOsBackend {
         Ok(output.status.success())
     }
 
-    fn install(&self, contents: &str) -> Result<(), ScheduleError> {
-        let previous = fs::read(&self.launch_agent).ok();
+    fn install_transactionally(
+        &self,
+        launch_agent_contents: &str,
+        settings_path: &Path,
+        settings_contents: &[u8],
+    ) -> Result<(), ScheduleError> {
+        let previous_agent = read_optional(&self.launch_agent, true)?;
+        let previous_settings = read_optional(settings_path, false)?;
         let was_loaded = self.is_loaded()?;
         fs::create_dir_all(&self.log_directory).map_err(|source| ScheduleError::Write {
             path: self.log_directory.clone(),
@@ -703,27 +1041,59 @@ impl MacOsBackend {
         if was_loaded {
             self.bootout()?;
         }
-        if let Err(error) = write_atomic(&self.launch_agent, contents.as_bytes(), 0o644) {
-            if was_loaded {
-                let _ = self.bootstrap();
-            }
-            return Err(error);
-        }
-        if let Err(error) = self.bootstrap() {
-            match previous {
-                Some(previous) => {
-                    let _ = write_atomic(&self.launch_agent, &previous, 0o644);
-                    if was_loaded {
-                        let _ = self.bootstrap();
-                    }
-                }
-                None => {
-                    let _ = fs::remove_file(&self.launch_agent);
-                }
+        let operation = (|| {
+            write_atomic(settings_path, settings_contents, 0o600)?;
+            write_atomic(&self.launch_agent, launch_agent_contents.as_bytes(), 0o644)?;
+            self.bootstrap()
+        })();
+        if let Err(error) = operation {
+            if let Err(rollback) = self.rollback_install(
+                settings_path,
+                previous_settings.as_deref(),
+                previous_agent.as_deref(),
+                was_loaded,
+            ) {
+                return Err(ScheduleError::TransactionRollback {
+                    operation: error.to_string(),
+                    rollback,
+                });
             }
             return Err(error);
         }
         Ok(())
+    }
+
+    fn rollback_install(
+        &self,
+        settings_path: &Path,
+        previous_settings: Option<&[u8]>,
+        previous_agent: Option<&[u8]>,
+        was_loaded: bool,
+    ) -> Result<(), String> {
+        let mut failures = Vec::new();
+        match self.is_loaded() {
+            Ok(true) => {
+                if let Err(error) = self.bootout() {
+                    failures.push(error.to_string());
+                }
+            }
+            Ok(false) => {}
+            Err(error) => failures.push(error.to_string()),
+        }
+        if let Err(error) = restore_file(settings_path, previous_settings, 0o600) {
+            failures.push(error.to_string());
+        }
+        if let Err(error) = restore_file(&self.launch_agent, previous_agent, 0o644) {
+            failures.push(error.to_string());
+        }
+        if was_loaded && let Err(error) = self.bootstrap() {
+            failures.push(error.to_string());
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
     }
 
     fn uninstall(&self) -> Result<(), ScheduleError> {
@@ -767,6 +1137,28 @@ impl MacOsBackend {
                 message: stderr_message(&output.stderr),
             })
         }
+    }
+}
+
+fn read_optional(path: &Path, launch_agent: bool) -> Result<Option<Vec<u8>>, ScheduleError> {
+    match fs::read(path) {
+        Ok(contents) => Ok(Some(contents)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) if launch_agent => Err(ScheduleError::ReadLaunchAgent {
+            path: path.to_path_buf(),
+            source,
+        }),
+        Err(source) => Err(ScheduleError::ReadSettings {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn restore_file(path: &Path, previous: Option<&[u8]>, mode: u32) -> Result<(), ScheduleError> {
+    match previous {
+        Some(contents) => write_atomic(path, contents, mode),
+        None => remove_if_exists(path),
     }
 }
 
@@ -941,14 +1333,20 @@ fn stderr_message(stderr: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{fs, path::PathBuf, time::Duration};
 
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
 
+    use crate::discovery::Repository;
+
     use super::{
-        LaunchAgent, MacOsBackend, Programs, ScheduleEnvironment, ScheduleMode, SchedulePaths,
-        ScheduleSettings, ensure_supported_platform, generate_launch_agent, load_settings,
-        remote_uses_ssh,
+        LaunchAgent, MacOsBackend, PreflightFailure, PreflightReport, Programs,
+        ScheduleEnvironment, ScheduleError, ScheduleMode, SchedulePaths, ScheduleSettings,
+        authorize_degraded_prune, ensure_supported_platform, generate_launch_agent,
+        inspect_installed_schedule, load_settings, preflight_repositories, remote_uses_ssh,
+        schedule_drift,
     };
 
     fn fixture() -> (ScheduleSettings, ScheduleEnvironment, SchedulePaths) {
@@ -962,6 +1360,7 @@ mod tests {
                     path: "/bin:/nix/store/git/bin:/nix/store/lop/bin:/nix/store/worktrunk/bin:/usr/bin"
                         .to_owned(),
                 },
+                home: PathBuf::from("/Users/test"),
                 ssh_auth_sock: Some(PathBuf::from("/private/tmp/agent.sock")),
             },
             SchedulePaths {
@@ -1028,9 +1427,100 @@ mod tests {
         assert!(remote_uses_ssh(
             "origin ssh://git@example.test/repo (fetch)"
         ));
+        assert!(remote_uses_ssh("origin xcel-github:owner/repo.git (fetch)"));
         assert!(!remote_uses_ssh(
             "origin https://github.com/owner/repo.git (fetch)"
         ));
+        assert!(!remote_uses_ssh("origin /srv/git/repo.git (fetch)"));
+    }
+
+    #[test]
+    fn installed_schedule_reports_command_and_drift() {
+        let (mut settings, environment, paths) = fixture();
+        let directory = tempdir().unwrap();
+        let plist = directory.path().join("agent.plist");
+        fs::write(
+            &plist,
+            generate_launch_agent(&settings, &environment, &paths).contents,
+        )
+        .unwrap();
+        let installed = inspect_installed_schedule(&plist).unwrap();
+        assert_eq!(
+            installed.arguments.as_deref(),
+            Some(&["/nix/store/lop/bin/lop".to_owned(), "scan".to_owned()][..])
+        );
+        assert!(schedule_drift(&settings, &environment, &installed).is_empty());
+
+        settings.mode = ScheduleMode::Prune;
+        assert_eq!(
+            schedule_drift(&settings, &environment, &installed),
+            ["installed command does not match configured prune mode"]
+        );
+    }
+
+    #[test]
+    fn degraded_preflight_allows_scan_install_and_requires_ack_for_prune_update() {
+        let report = PreflightReport {
+            failures: vec![PreflightFailure {
+                repository: PathBuf::from("/src/broken"),
+                message: "credentials rejected".to_owned(),
+            }],
+        };
+        let mut settings = ScheduleSettings::default();
+        authorize_degraded_prune(&settings, &report, false).unwrap();
+        settings.mode = ScheduleMode::Prune;
+        assert!(matches!(
+            authorize_degraded_prune(&settings, &report, false),
+            Err(ScheduleError::DegradedPruneRequiresAcknowledgement)
+        ));
+        authorize_degraded_prune(&settings, &report, true).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initial_and_update_preflights_aggregate_failures_and_check_every_repository() {
+        let directory = tempdir().unwrap();
+        let script = directory.path().join("git");
+        let log = directory.path().join("fetches");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncase \"$3\" in\n  remote) exit 0 ;;\n  fetch) echo \"$2\" >> {log:?}; case \"$2\" in *broken*) echo 'alias host could not be resolved' >&2; exit 1 ;; esac ;;\nesac\n",
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let repositories: Vec<_> = ["healthy-a", "broken", "healthy-b"]
+            .into_iter()
+            .map(|name| Repository {
+                path: directory.path().join(name),
+                git_common_directory: directory.path().join(name).join(".git"),
+            })
+            .collect();
+        let environment = ScheduleEnvironment {
+            programs: Programs {
+                lop: PathBuf::from("/bin/lop"),
+                git: script,
+                worktrunk: PathBuf::from("/bin/wt"),
+                path: "/usr/bin:/bin".to_owned(),
+            },
+            home: directory.path().to_path_buf(),
+            ssh_auth_sock: None,
+        };
+
+        for _ in ["initial install", "schedule update"] {
+            let report =
+                preflight_repositories(&environment, &repositories, Duration::from_secs(2))
+                    .unwrap();
+            assert_eq!(report.failures.len(), 1);
+            assert_eq!(report.failures[0].repository, repositories[1].path);
+            assert!(
+                report.failures[0]
+                    .message
+                    .contains("alias host could not be resolved")
+            );
+        }
+        assert_eq!(fs::read_to_string(log).unwrap().lines().count(), 6);
     }
 
     #[cfg(unix)]
@@ -1059,14 +1549,55 @@ mod tests {
         let agent = LaunchAgent {
             contents: "plist-v1".to_owned(),
         };
+        let settings = directory.path().join("config/schedule.toml");
 
-        backend.install(&agent.contents).unwrap();
-        backend.install(&agent.contents).unwrap();
+        backend
+            .install_transactionally(&agent.contents, &settings, b"settings-v1")
+            .unwrap();
+        backend
+            .install_transactionally(&agent.contents, &settings, b"settings-v1")
+            .unwrap();
         assert!(backend.is_loaded().unwrap());
         assert_eq!(fs::read_to_string(&launch_agent).unwrap(), "plist-v1");
+        assert_eq!(fs::read_to_string(&settings).unwrap(), "settings-v1");
         backend.uninstall().unwrap();
         backend.uninstall().unwrap();
         assert!(!launch_agent.exists());
         assert!(!backend.is_loaded().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_schedule_update_restores_settings_agent_and_loaded_state() {
+        let directory = tempdir().unwrap();
+        let state = directory.path().join("loaded");
+        let script = directory.path().join("launchctl");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in\nprint) test -f {state:?} ;;\nbootstrap) case \"$(/bin/cat \"$3\")\" in *plist-v2*) echo rejected >&2; exit 1 ;; esac; touch {state:?} ;;\nbootout) rm -f {state:?} ;;\n*) exit 2 ;;\nesac\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let launch_agent = directory.path().join("LaunchAgents/org.nixos.lop.plist");
+        let settings = directory.path().join("config/schedule.toml");
+        let backend = MacOsBackend {
+            launchctl: script,
+            domain: "gui/501".to_owned(),
+            launch_agent: launch_agent.clone(),
+            log_directory: directory.path().join("logs"),
+        };
+
+        backend
+            .install_transactionally("plist-v1", &settings, b"settings-v1")
+            .unwrap();
+        let error = backend
+            .install_transactionally("plist-v2", &settings, b"settings-v2")
+            .unwrap_err();
+        assert!(error.to_string().contains("bootstrap"));
+        assert_eq!(fs::read_to_string(&launch_agent).unwrap(), "plist-v1");
+        assert_eq!(fs::read_to_string(&settings).unwrap(), "settings-v1");
+        assert!(backend.is_loaded().unwrap());
     }
 }

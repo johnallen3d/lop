@@ -89,20 +89,40 @@ from 300 through 604,800 seconds before replacing and reloading the agent.
 
 The generated LaunchAgent runs at load without `KeepAlive`, uses an explicit
 PATH containing Lop, Git, and Worktrunk, disables terminal credential prompts,
-and carries a validated `SSH_AUTH_SOCK` when present. Installation performs a
-noninteractive dry-run fetch against every discovered repository before loading
-the agent. This catches missing credentials in the launchd environment rather
-than relying on an interactive shell. Lop's process-wide lock prevents overlap.
-Install and uninstall are safe to repeat; uninstall removes the LaunchAgent and
-schedule settings while retaining logs. Other platforms return a scheduling-
-unavailable error without changing manual command behavior.
+and carries a validated `SSH_AUTH_SOCK` when present. Installation verifies the
+scheduler's binaries, runtime paths, and credential mechanism, then performs a
+noninteractive dry-run fetch against **every** discovered repository. Repository
+fetch failures are aggregated and printed as warnings; they do not prevent a
+`scan` schedule from being installed or refreshed. Scheduled runs fail closed
+for each affected repository, leave all of its worktrees untouched, and continue
+processing healthy repositories. This isolates an offline remote or broken SSH
+host alias without hiding the repository configuration problem.
 
-Keep the schedule in `scan` mode while reviewing preview evidence. Enabling
-`prune` mode requires separate explicit approval after false positives are
-resolved. To roll back unattended cleanup, use `lop schedule edit` and set
-`mode = "scan"`; to stop all scheduled runs, use `lop schedule uninstall`.
-After the first approved cleanup run, manually compare every `removed` record's
-`branch_*` reason code with Git's surviving worktrees and local branches.
+Keep the schedule in `scan` mode while reviewing preview evidence. If any
+repository preflight is degraded, installing or updating `prune` mode requires
+an additional deliberate acknowledgement:
+
+```console
+lop schedule install --allow-degraded-preflight
+lop schedule edit --allow-degraded-preflight
+```
+
+Use the flag only after reviewing every warning. `lop schedule status` reports
+the configured mode, actual installed command and interval, settings/artifact
+drift, and repositories that currently fail preflight. Rerun `lop schedule
+install` after credentials, network access, or remote configuration is repaired
+to confirm recovery. Schedule settings and the LaunchAgent are updated as one
+transaction; a failed reload restores both previous files and the prior loaded
+service, or reports any rollback failure explicitly.
+
+Lop's process-wide lock prevents overlap. Install and uninstall are safe to
+repeat; uninstall removes the LaunchAgent and schedule settings while retaining
+logs. Other platforms return a scheduling-unavailable error without changing
+manual command behavior. To roll back unattended cleanup, use `lop schedule
+edit` and set `mode = "scan"`; to stop all scheduled runs, use `lop schedule
+uninstall`. After the first approved cleanup run, manually compare every
+`removed` record's `branch_*` reason code with Git's surviving worktrees and
+local branches.
 
 ## Declarative package
 
