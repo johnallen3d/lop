@@ -146,12 +146,21 @@ Scheduling remains opt-in after package installation, so `lop scan` and
 
 ## Development
 
+Install the pinned development toolchain and run the complete validation suite:
+
 ```console
-make check
+mise install
+mise run check
 ```
 
-Individual tasks are `make fmt`, `make test`, and `make lint`. The lint task runs
-warning-denied Clippy with the `pedantic` lint group enabled.
+The checked-in configuration requires mise 2025.1 or newer and pins Rust 1.88.0
+with the `rustfmt` and `clippy` components, matching the `rust-version` in
+`Cargo.toml`. The Nix package inputs remain pinned by `flake.lock`.
+
+Use `mise run fmt` to format sources, `mise run fmt-check` to check formatting,
+`mise run test` to run tests, and `mise run lint` to run warning-denied Clippy
+with the `pedantic` lint group enabled. `mise run check` runs all non-mutating
+checks.
 
 ## License
 

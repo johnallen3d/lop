@@ -1,0 +1,24 @@
+min_version = "2025.1.0"
+
+[tools]
+rust = { version = "1.88.0", profile = "minimal", components = ["rustfmt", "clippy"] }
+
+[tasks.fmt]
+description = "Format Rust sources"
+run = "cargo fmt"
+
+[tasks.fmt-check]
+description = "Check Rust formatting"
+run = "cargo fmt --check"
+
+[tasks.test]
+description = "Run the test suite"
+run = "cargo test"
+
+[tasks.lint]
+description = "Run Clippy with warnings denied and pedantic lints"
+run = "cargo clippy --all-targets --all-features -- -D warnings -D clippy::pedantic"
+
+[tasks.check]
+description = "Run all required checks"
+depends = ["fmt-check", "test", "lint"]
