@@ -126,12 +126,15 @@ local branches.
 
 ## Declarative package
 
-The flake exports `packages.<system>.lop` and `packages.<system>.default`. A
-`system-config` flake can package Lop declaratively by adding this repository as
-an input and including the package in Home Manager:
+The canonical public repository is
+[`https://github.com/johnallen3d/lop`](https://github.com/johnallen3d/lop). The
+flake exports `packages.<system>.lop` and `packages.<system>.default`. A
+`system-config` flake can package Lop declaratively by adding the canonical
+repository as an input and including the package in Home Manager. Replace the
+input owner only when intentionally tracking a fork:
 
 ```nix
-# flake inputs
+# flake inputs: canonical Lop repository
 lop.url = "github:johnallen3d/lop";
 
 # Home Manager module arguments include `lop`
