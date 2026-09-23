@@ -129,7 +129,13 @@ impl Fixture {
             .env("XDG_CONFIG_HOME", &self.config_home)
             .env("XDG_STATE_HOME", &self.state_home)
             .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_TERMINAL_PROMPT", "0");
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env_remove("HERDR_ENV")
+            .env_remove("HERDR_SESSION")
+            .env_remove("HERDR_SOCKET_PATH")
+            .env_remove("HERDR_WORKSPACE_ID")
+            .env_remove("HERDR_TAB_ID")
+            .env_remove("HERDR_PANE_ID");
         if let Some(path) = path {
             command.env("PATH", path);
         }
@@ -357,7 +363,7 @@ fn herdr_retirement_failure_preserves_worktree_and_branch() {
     fs::write(
         &herdr,
         format!(
-            "#!/bin/sh\nif [ \"$1\" = api ]; then cat '{}'; elif [ \"$1 $2\" = 'pane process-info' ]; then printf '%s' '{{\"id\":\"test\",\"result\":{{\"type\":\"pane_process_info\",\"process_info\":{{\"pane_id\":\"w1:p1\",\"shell_pid\":41,\"foreground_processes\":[]}}}}}}'; else printf '%s\\n' \"$*\" > '{}'; echo retirement-failed >&2; exit 1; fi\n",
+            "#!/bin/sh\nif [ \"$1 $2 $3\" = 'session list --json' ]; then printf '%s' '{{\"sessions\":[{{\"name\":\"test\",\"running\":true,\"socket_path\":\"/tmp/test.sock\"}}]}}'; elif [ \"$1 $2 $3 $4\" = '--session test api snapshot' ]; then cat '{}'; elif [ \"$1 $2 $3 $4\" = '--session test pane process-info' ]; then printf '%s' '{{\"id\":\"test\",\"result\":{{\"type\":\"pane_process_info\",\"process_info\":{{\"pane_id\":\"w1:p1\",\"shell_pid\":41,\"foreground_processes\":[]}}}}}}'; else printf '%s\\n' \"$*\" > '{}'; echo retirement-failed >&2; exit 1; fi\n",
             snapshot_path.display(),
             close_log.display()
         ),
@@ -394,7 +400,7 @@ fn herdr_retirement_failure_preserves_worktree_and_branch() {
     assert_eq!(records.last().unwrap()["operational_failures"], 1);
     assert_eq!(
         fs::read_to_string(close_log).unwrap().trim(),
-        "workspace close w1"
+        "--session test workspace close w1"
     );
 }
 
@@ -440,7 +446,7 @@ fn lop_previews_and_retires_stale_herdr_workspace() {
 
 #[cfg(unix)]
 #[test]
-fn scan_reports_idle_herdr_coordination_without_closing_workspace() {
+fn scheduled_scan_discovers_herdr_without_inherited_session_context() {
     let fixture = Fixture::new();
     let worktree = fixture.integrated_worktree("herdr-preview");
     let initial = herdr_snapshot(&worktree, false, "idle");
@@ -720,7 +726,7 @@ fn install_stateful_herdr(
     fs::write(
         &herdr,
         format!(
-            "#!/bin/sh\nif [ \"$1\" = api ]; then if [ -e '{close_marker}' ]; then cat '{after_path}'; else cat '{initial_path}'; fi; elif [ \"$1 $2\" = 'pane process-info' ]; then printf '%s' '{{\"id\":\"test\",\"result\":{{\"type\":\"pane_process_info\",\"process_info\":{{\"pane_id\":\"w1:p1\",\"shell_pid\":{shell_pid},\"foreground_processes\":[]}}}}}}'; else {close_action}; touch '{close_marker}'; printf '%s' '{{\"id\":\"test\",\"result\":{{\"type\":\"workspace_closed\",\"workspace_id\":\"w1\"}}}}'; fi\n",
+            "#!/bin/sh\nif [ \"$1 $2 $3\" = 'session list --json' ]; then printf '%s' '{{\"sessions\":[{{\"name\":\"test\",\"running\":true,\"socket_path\":\"/tmp/test.sock\"}}]}}'; elif [ \"$1 $2 $3 $4\" = '--session test api snapshot' ]; then if [ -e '{close_marker}' ]; then cat '{after_path}'; else cat '{initial_path}'; fi; elif [ \"$1 $2 $3 $4\" = '--session test pane process-info' ]; then printf '%s' '{{\"id\":\"test\",\"result\":{{\"type\":\"pane_process_info\",\"process_info\":{{\"pane_id\":\"w1:p1\",\"shell_pid\":{shell_pid},\"foreground_processes\":[]}}}}}}'; else {close_action}; touch '{close_marker}'; printf '%s' '{{\"id\":\"test\",\"result\":{{\"type\":\"workspace_closed\",\"workspace_id\":\"w1\"}}}}'; fi\n",
             close_marker = close_marker.display(),
             after_path = after_path.display(),
             initial_path = initial_path.display(),

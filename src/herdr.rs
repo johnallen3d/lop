@@ -11,10 +11,23 @@ use std::{
 use serde::Deserialize;
 use thiserror::Error;
 
+#[derive(Debug, Clone, Eq, Ord, PartialEq, PartialOrd)]
+struct SessionIdentity {
+    name: String,
+    socket_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Eq, Ord, PartialEq, PartialOrd)]
+struct SessionTarget {
+    session: SessionIdentity,
+    id: String,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Coordination {
-    workspaces: Vec<String>,
-    panes: Vec<String>,
+    sessions: BTreeSet<SessionIdentity>,
+    workspaces: BTreeSet<SessionTarget>,
+    panes: BTreeSet<SessionTarget>,
     processes: BTreeSet<u32>,
 }
 
@@ -32,6 +45,13 @@ impl Coordination {
     #[must_use]
     pub fn workspace_count(&self) -> usize {
         self.workspaces.len()
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.sessions.extend(other.sessions);
+        self.workspaces.extend(other.workspaces);
+        self.panes.extend(other.panes);
+        self.processes.extend(other.processes);
     }
 }
 
@@ -65,6 +85,8 @@ pub enum InspectionError {
     IncompleteActivity(String),
     #[error("Herdr pane process inspection failed: {0}")]
     ProcessInspection(String),
+    #[error("Herdr session inspection failed: {0}")]
+    SessionInspection(String),
 }
 
 #[derive(Debug, Error)]
@@ -126,25 +148,20 @@ fn inspect_candidate_with_program(
     timeout: Duration,
     program: &Path,
 ) -> Result<CandidateStatus, InspectionError> {
-    let output = match run(program, &["api", "snapshot"], timeout) {
-        CommandResult::Unavailable => return Ok(CandidateStatus::Unavailable),
-        CommandResult::Output(output) if !output.status.success() => {
-            return Ok(CandidateStatus::Unavailable);
-        }
-        CommandResult::Output(output) => output,
+    let Some(snapshots) = inspect_session_snapshots(timeout, program)? else {
+        return Ok(CandidateStatus::Unavailable);
     };
-
-    let envelope: SnapshotEnvelope =
-        serde_json::from_slice(&output.stdout).map_err(InspectionError::MalformedJson)?;
-    if envelope.result.kind != "session_snapshot" {
-        return Err(InspectionError::MalformedResult(format!(
-            "expected session_snapshot result, received {:?}",
-            envelope.result.kind
-        )));
+    let sessions = snapshots
+        .iter()
+        .map(|observed| observed.session.clone())
+        .collect();
+    let mut combined = CandidateStatus::Clear(empty_coordination(sessions));
+    for observed in &snapshots {
+        let status = evaluate_snapshot(&observed.snapshot, candidate, &observed.session)?;
+        combined = merge_candidate_status(combined, status);
     }
-    let status = evaluate_snapshot(&envelope.result.snapshot, candidate)?;
-    let CandidateStatus::Clear(mut coordination) = status else {
-        return Ok(status);
+    let CandidateStatus::Clear(mut coordination) = combined else {
+        return Ok(combined);
     };
     coordination.processes = inspect_pane_processes(&coordination.panes, timeout, program)?;
     Ok(CandidateStatus::Clear(coordination))
@@ -156,56 +173,45 @@ fn inspect_stale_workspaces_with_program(
     timeout: Duration,
     program: &Path,
 ) -> Result<StaleWorkspaceStatus, InspectionError> {
-    let output = match run(program, &["api", "snapshot"], timeout) {
-        CommandResult::Unavailable => return Ok(StaleWorkspaceStatus::Unavailable),
-        CommandResult::Output(output) if !output.status.success() => {
-            return Ok(StaleWorkspaceStatus::Unavailable);
-        }
-        CommandResult::Output(output) => output,
+    let Some(snapshots) = inspect_session_snapshots(timeout, program)? else {
+        return Ok(StaleWorkspaceStatus::Unavailable);
     };
-    let envelope: SnapshotEnvelope =
-        serde_json::from_slice(&output.stdout).map_err(InspectionError::MalformedJson)?;
-    if envelope.result.kind != "session_snapshot" {
-        return Err(InspectionError::MalformedResult(format!(
-            "expected session_snapshot result, received {:?}",
-            envelope.result.kind
-        )));
-    }
-    validate_snapshot(&envelope.result.snapshot)?;
-
-    let mut stale = Vec::new();
-    for workspace in &envelope.result.snapshot.workspaces {
-        let Some(worktree) = workspace.worktree.as_ref() else {
-            continue;
-        };
-        if worktree.is_linked_worktree != Some(true)
-            || !worktree
-                .repo_key
-                .as_deref()
-                .is_some_and(|repo_key| paths_equal(repo_key, git_common_directory))
-            || inventory_paths.contains(&worktree.checkout_path)
-            || worktree.checkout_path.exists()
-        {
-            continue;
-        }
-        let status = evaluate_stale_workspace(
-            &envelope.result.snapshot,
-            workspace,
-            worktree,
-            git_common_directory,
-        )?;
-        let status = match status {
-            CandidateStatus::Clear(mut coordination) => {
-                coordination.processes =
-                    inspect_pane_processes(&coordination.panes, timeout, program)?;
-                CandidateStatus::Clear(coordination)
+    let sessions: BTreeSet<_> = snapshots
+        .iter()
+        .map(|observed| observed.session.clone())
+        .collect();
+    let mut stale: Vec<StaleWorkspace> = Vec::new();
+    for observed in &snapshots {
+        validate_snapshot(&observed.snapshot)?;
+        for workspace in &observed.snapshot.workspaces {
+            let Some(worktree) = workspace.worktree.as_ref() else {
+                continue;
+            };
+            if worktree.is_linked_worktree != Some(true)
+                || !worktree
+                    .repo_key
+                    .as_deref()
+                    .is_some_and(|repo_key| paths_equal(repo_key, git_common_directory))
+                || inventory_paths.contains(&worktree.checkout_path)
+                || worktree.checkout_path.exists()
+            {
+                continue;
             }
-            status => status,
-        };
-        stale.push(StaleWorkspace {
-            checkout_path: worktree.checkout_path.clone(),
-            status,
-        });
+            let status = evaluate_stale_workspace(
+                &observed.snapshot,
+                workspace,
+                worktree,
+                git_common_directory,
+                &observed.session,
+            )?;
+            merge_stale_workspace(&mut stale, &worktree.checkout_path, status);
+        }
+    }
+    for workspace in &mut stale {
+        if let CandidateStatus::Clear(coordination) = &mut workspace.status {
+            coordination.sessions.clone_from(&sessions);
+            coordination.processes = inspect_pane_processes(&coordination.panes, timeout, program)?;
+        }
     }
     Ok(StaleWorkspaceStatus::Inspected(stale))
 }
@@ -213,6 +219,7 @@ fn inspect_stale_workspaces_with_program(
 fn evaluate_snapshot(
     snapshot: &Snapshot,
     candidate: &Path,
+    session: &SessionIdentity,
 ) -> Result<CandidateStatus, InspectionError> {
     validate_snapshot(snapshot)?;
 
@@ -235,11 +242,11 @@ fn evaluate_snapshot(
                 .is_some_and(|focused| focused == pane.id)
         {
             return Ok(CandidateStatus::FocusedPane {
-                pane_id: pane.id.clone(),
+                pane_id: scoped_id(session, &pane.id),
             });
         }
         if pane.agent.is_some()
-            && let Some(veto) = activity_veto(pane.status, &pane.id, "pane")?
+            && let Some(veto) = activity_veto(pane.status, &scoped_id(session, &pane.id), "pane")?
         {
             return Ok(veto);
         }
@@ -251,14 +258,21 @@ fn evaluate_snapshot(
             || candidate_panes.iter().any(|pane| pane.id == agent.id)
             || candidate_workspaces.contains(agent.workspace_id.as_str())
     }) {
-        if let Some(veto) = activity_veto(agent.status, &agent.id, "agent")? {
+        if let Some(veto) = activity_veto(agent.status, &scoped_id(session, &agent.id), "agent")? {
             return Ok(veto);
         }
     }
 
     Ok(CandidateStatus::Clear(Coordination {
-        workspaces: cleanup_workspace_ids(snapshot, candidate, candidate_workspaces),
-        panes: candidate_panes.iter().map(|pane| pane.id.clone()).collect(),
+        sessions: [session.clone()].into_iter().collect(),
+        workspaces: cleanup_workspace_ids(snapshot, candidate, candidate_workspaces)
+            .into_iter()
+            .map(|id| session_target(session, id))
+            .collect(),
+        panes: candidate_panes
+            .iter()
+            .map(|pane| session_target(session, pane.id.clone()))
+            .collect(),
         processes: BTreeSet::new(),
     }))
 }
@@ -278,6 +292,7 @@ fn evaluate_stale_workspace(
     workspace: &Workspace,
     worktree: &WorkspaceWorktree,
     git_common_directory: &Path,
+    session: &SessionIdentity,
 ) -> Result<CandidateStatus, InspectionError> {
     let panes: Vec<_> = snapshot
         .panes
@@ -298,7 +313,7 @@ fn evaluate_stale_workspace(
                 .is_some_and(|focused| focused == pane.id)
         {
             return Ok(CandidateStatus::FocusedPane {
-                pane_id: pane.id.clone(),
+                pane_id: scoped_id(session, &pane.id),
             });
         }
         if !stale_pane_belongs_to_checkout(pane, &worktree.checkout_path, git_common_directory) {
@@ -308,7 +323,7 @@ fn evaluate_stale_workspace(
             )));
         }
         if pane.agent.is_some()
-            && let Some(veto) = activity_veto(pane.status, &pane.id, "pane")?
+            && let Some(veto) = activity_veto(pane.status, &scoped_id(session, &pane.id), "pane")?
         {
             return Ok(veto);
         }
@@ -318,13 +333,19 @@ fn evaluate_stale_workspace(
         .iter()
         .filter(|agent| agent.workspace_id == workspace.workspace_id)
     {
-        if let Some(veto) = activity_veto(agent.status, &agent.id, "agent")? {
+        if let Some(veto) = activity_veto(agent.status, &scoped_id(session, &agent.id), "agent")? {
             return Ok(veto);
         }
     }
     Ok(CandidateStatus::Clear(Coordination {
-        workspaces: vec![workspace.workspace_id.clone()],
-        panes: panes.iter().map(|pane| pane.id.clone()).collect(),
+        sessions: [session.clone()].into_iter().collect(),
+        workspaces: [session_target(session, workspace.workspace_id.clone())]
+            .into_iter()
+            .collect(),
+        panes: panes
+            .iter()
+            .map(|pane| session_target(session, pane.id.clone()))
+            .collect(),
         processes: BTreeSet::new(),
     }))
 }
@@ -452,26 +473,165 @@ fn cleanup_workspace_ids<'a>(
     workspace_ids.into_iter().map(str::to_owned).collect()
 }
 
+fn empty_coordination(sessions: BTreeSet<SessionIdentity>) -> Coordination {
+    Coordination {
+        sessions,
+        workspaces: BTreeSet::new(),
+        panes: BTreeSet::new(),
+        processes: BTreeSet::new(),
+    }
+}
+
+fn session_target(session: &SessionIdentity, id: String) -> SessionTarget {
+    SessionTarget {
+        session: session.clone(),
+        id,
+    }
+}
+
+fn scoped_id(session: &SessionIdentity, id: &str) -> String {
+    format!("{}/{id}", session.name)
+}
+
+fn merge_candidate_status(left: CandidateStatus, right: CandidateStatus) -> CandidateStatus {
+    match (left, right) {
+        (CandidateStatus::Clear(mut left), CandidateStatus::Clear(right)) => {
+            left.merge(right);
+            CandidateStatus::Clear(left)
+        }
+        (focused @ CandidateStatus::FocusedPane { .. }, _)
+        | (_, focused @ CandidateStatus::FocusedPane { .. }) => focused,
+        (active @ CandidateStatus::ActiveAgent { .. }, _)
+        | (_, active @ CandidateStatus::ActiveAgent { .. }) => active,
+        (CandidateStatus::Unavailable, _) | (_, CandidateStatus::Unavailable) => {
+            CandidateStatus::Unavailable
+        }
+    }
+}
+
+fn merge_stale_workspace(
+    stale: &mut Vec<StaleWorkspace>,
+    checkout_path: &Path,
+    status: CandidateStatus,
+) {
+    if let Some(existing) = stale
+        .iter_mut()
+        .find(|workspace| paths_equal(&workspace.checkout_path, checkout_path))
+    {
+        let previous = std::mem::replace(&mut existing.status, CandidateStatus::Unavailable);
+        existing.status = merge_candidate_status(previous, status);
+    } else {
+        stale.push(StaleWorkspace {
+            checkout_path: checkout_path.to_path_buf(),
+            status,
+        });
+    }
+}
+
+fn inspect_session_snapshots(
+    timeout: Duration,
+    program: &Path,
+) -> Result<Option<Vec<ObservedSnapshot>>, InspectionError> {
+    let Some(sessions) = discover_sessions(timeout, program)? else {
+        return Ok(None);
+    };
+    let mut snapshots = Vec::with_capacity(sessions.len());
+    for session in sessions {
+        let output = match run(
+            program,
+            &["--session", &session.name, "api", "snapshot"],
+            timeout,
+        ) {
+            CommandResult::Unavailable => {
+                return Err(InspectionError::SessionInspection(format!(
+                    "session {} became unavailable",
+                    session.name
+                )));
+            }
+            CommandResult::Output(output) if !output.status.success() => {
+                return Err(InspectionError::SessionInspection(format!(
+                    "session {}: {}",
+                    session.name,
+                    stderr_message(&output.stderr)
+                )));
+            }
+            CommandResult::Output(output) => output,
+        };
+        let envelope: SnapshotEnvelope =
+            serde_json::from_slice(&output.stdout).map_err(InspectionError::MalformedJson)?;
+        if envelope.result.kind != "session_snapshot" {
+            return Err(InspectionError::MalformedResult(format!(
+                "session {}: expected session_snapshot result, received {:?}",
+                session.name, envelope.result.kind
+            )));
+        }
+        snapshots.push(ObservedSnapshot {
+            session,
+            snapshot: envelope.result.snapshot,
+        });
+    }
+    Ok(Some(snapshots))
+}
+
+fn discover_sessions(
+    timeout: Duration,
+    program: &Path,
+) -> Result<Option<BTreeSet<SessionIdentity>>, InspectionError> {
+    let output = match run(program, &["session", "list", "--json"], timeout) {
+        CommandResult::Unavailable => return Ok(None),
+        CommandResult::Output(output) if !output.status.success() => return Ok(None),
+        CommandResult::Output(output) => output,
+    };
+    let listing: SessionListEnvelope =
+        serde_json::from_slice(&output.stdout).map_err(InspectionError::MalformedJson)?;
+    let mut sessions = BTreeSet::new();
+    let mut names = BTreeSet::new();
+    for session in listing
+        .sessions
+        .into_iter()
+        .filter(|session| session.running)
+    {
+        if session.name.trim().is_empty() || !names.insert(session.name.clone()) {
+            return Err(InspectionError::MalformedResult(
+                "running session list contains an empty or duplicate name".to_owned(),
+            ));
+        }
+        sessions.insert(SessionIdentity {
+            name: session.name,
+            socket_path: session.socket_path,
+        });
+    }
+    Ok(Some(sessions))
+}
+
 fn inspect_pane_processes(
-    pane_ids: &[String],
+    panes: &BTreeSet<SessionTarget>,
     timeout: Duration,
     program: &Path,
 ) -> Result<BTreeSet<u32>, InspectionError> {
     let mut process_ids = BTreeSet::new();
-    for pane_id in pane_ids {
+    for pane in panes {
+        let label = scoped_id(&pane.session, &pane.id);
         let output = match run(
             program,
-            &["pane", "process-info", "--pane", pane_id],
+            &[
+                "--session",
+                &pane.session.name,
+                "pane",
+                "process-info",
+                "--pane",
+                &pane.id,
+            ],
             timeout,
         ) {
             CommandResult::Unavailable => {
                 return Err(InspectionError::ProcessInspection(format!(
-                    "pane {pane_id}: client or socket became unavailable"
+                    "pane {label}: client or socket became unavailable"
                 )));
             }
             CommandResult::Output(output) if !output.status.success() => {
                 return Err(InspectionError::ProcessInspection(format!(
-                    "pane {pane_id}: {}",
+                    "pane {label}: {}",
                     stderr_message(&output.stderr)
                 )));
             }
@@ -479,20 +639,18 @@ fn inspect_pane_processes(
         };
         let envelope: ProcessInfoEnvelope =
             serde_json::from_slice(&output.stdout).map_err(|error| {
-                InspectionError::ProcessInspection(format!(
-                    "pane {pane_id}: malformed JSON: {error}"
-                ))
+                InspectionError::ProcessInspection(format!("pane {label}: malformed JSON: {error}"))
             })?;
         if envelope.result.kind != "pane_process_info"
-            || envelope.result.process_info.pane_id != *pane_id
+            || envelope.result.process_info.pane_id != pane.id
         {
             return Err(InspectionError::ProcessInspection(format!(
-                "pane {pane_id}: malformed process-info result"
+                "pane {label}: malformed process-info result"
             )));
         }
         let info = envelope.result.process_info;
         let shell_pid = info.shell_pid.ok_or_else(|| {
-            InspectionError::ProcessInspection(format!("pane {pane_id}: shell PID is missing"))
+            InspectionError::ProcessInspection(format!("pane {label}: shell PID is missing"))
         })?;
         process_ids.insert(shell_pid);
         process_ids.extend(
@@ -509,14 +667,26 @@ fn retire_candidate_with_program(
     timeout: Duration,
     program: &Path,
 ) -> Result<(), RetirementError> {
+    verify_coordination_unchanged(coordination, timeout, program)?;
     let mut failures = Vec::new();
-    for workspace_id in &coordination.workspaces {
-        match run(program, &["workspace", "close", workspace_id], timeout) {
+    for workspace in &coordination.workspaces {
+        let label = scoped_id(&workspace.session, &workspace.id);
+        match run(
+            program,
+            &[
+                "--session",
+                &workspace.session.name,
+                "workspace",
+                "close",
+                &workspace.id,
+            ],
+            timeout,
+        ) {
             CommandResult::Unavailable => failures.push(format!(
-                "workspace {workspace_id}: client or socket became unavailable"
+                "workspace {label}: client or socket became unavailable"
             )),
             CommandResult::Output(output) if !output.status.success() => failures.push(format!(
-                "workspace {workspace_id}: {}",
+                "workspace {label}: {}",
                 stderr_message(&output.stderr)
             )),
             CommandResult::Output(output) => {
@@ -524,15 +694,17 @@ fn retire_candidate_with_program(
                     .is_ok_and(|response| {
                         response.result.kind == "ok"
                             || (response.result.kind == "workspace_closed"
-                                && response.result.workspace_id.as_deref() == Some(workspace_id))
+                                && response.result.workspace_id.as_deref()
+                                    == Some(workspace.id.as_str()))
                     });
                 if !valid {
-                    failures.push(format!(
-                        "workspace {workspace_id}: malformed command response"
-                    ));
+                    failures.push(format!("workspace {label}: malformed command response"));
                 }
             }
         }
+    }
+    if let Err(error) = verify_observed_sessions(coordination, timeout, program) {
+        failures.push(error.message);
     }
 
     if failures.is_empty() {
@@ -541,6 +713,125 @@ fn retire_candidate_with_program(
         Err(RetirementError {
             message: failures.join("; "),
         })
+    }
+}
+
+fn verify_coordination_unchanged(
+    coordination: &Coordination,
+    timeout: Duration,
+    program: &Path,
+) -> Result<(), RetirementError> {
+    let snapshots = inspect_session_snapshots(timeout, program)
+        .map_err(|error| RetirementError {
+            message: error.to_string(),
+        })?
+        .ok_or_else(|| RetirementError {
+            message: "Herdr session discovery became unavailable during retirement".to_owned(),
+        })?;
+    let sessions: BTreeSet<_> = snapshots
+        .iter()
+        .map(|observed| observed.session.clone())
+        .collect();
+    if sessions != coordination.sessions {
+        return Err(RetirementError {
+            message: "running Herdr sessions changed during retirement".to_owned(),
+        });
+    }
+
+    let mut panes = BTreeSet::new();
+    for workspace in &coordination.workspaces {
+        let snapshot = snapshots
+            .iter()
+            .find(|observed| observed.session == workspace.session)
+            .map(|observed| &observed.snapshot)
+            .ok_or_else(|| RetirementError {
+                message: format!(
+                    "session {} became unavailable during retirement",
+                    workspace.session.name
+                ),
+            })?;
+        if !snapshot
+            .workspaces
+            .iter()
+            .any(|observed| observed.workspace_id == workspace.id)
+        {
+            return Err(RetirementError {
+                message: format!(
+                    "workspace {} changed during retirement",
+                    scoped_id(&workspace.session, &workspace.id)
+                ),
+            });
+        }
+        for pane in snapshot
+            .panes
+            .iter()
+            .filter(|pane| pane.workspace_id == workspace.id)
+        {
+            if pane.focused
+                || snapshot
+                    .focused_pane_id
+                    .as_deref()
+                    .is_some_and(|focused| focused == pane.id)
+                || (pane.agent.is_some()
+                    && activity_veto(pane.status, &pane.id, "pane")
+                        .map_err(|error| RetirementError {
+                            message: error.to_string(),
+                        })?
+                        .is_some())
+            {
+                return Err(RetirementError {
+                    message: format!(
+                        "workspace {} changed during retirement",
+                        scoped_id(&workspace.session, &workspace.id)
+                    ),
+                });
+            }
+            panes.insert(session_target(&workspace.session, pane.id.clone()));
+        }
+        for agent in snapshot
+            .agents
+            .iter()
+            .filter(|agent| agent.workspace_id == workspace.id)
+        {
+            if activity_veto(agent.status, &agent.id, "agent")
+                .map_err(|error| RetirementError {
+                    message: error.to_string(),
+                })?
+                .is_some()
+            {
+                return Err(RetirementError {
+                    message: format!(
+                        "workspace {} changed during retirement",
+                        scoped_id(&workspace.session, &workspace.id)
+                    ),
+                });
+            }
+        }
+    }
+    if panes != coordination.panes {
+        return Err(RetirementError {
+            message: "Herdr workspace panes changed during retirement".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn verify_observed_sessions(
+    coordination: &Coordination,
+    timeout: Duration,
+    program: &Path,
+) -> Result<(), RetirementError> {
+    match discover_sessions(timeout, program) {
+        Ok(Some(sessions)) if sessions == coordination.sessions => Ok(()),
+        Ok(Some(_)) => Err(RetirementError {
+            message: "running Herdr sessions changed during retirement".to_owned(),
+        }),
+        Ok(None) => Err(RetirementError {
+            message: "Herdr session discovery became unavailable during retirement".to_owned(),
+        }),
+        Err(error) => Err(RetirementError {
+            message: error.to_string(),
+        }),
     }
 }
 
@@ -574,6 +865,24 @@ fn path_is_within(path: &Path, candidate: &Path) -> bool {
     let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let candidate = fs::canonicalize(candidate).unwrap_or_else(|_| candidate.to_path_buf());
     resolved == candidate || resolved.starts_with(candidate)
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionListEnvelope {
+    sessions: Vec<ListedSession>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListedSession {
+    name: String,
+    running: bool,
+    socket_path: PathBuf,
+}
+
+#[derive(Debug)]
+struct ObservedSnapshot {
+    session: SessionIdentity,
+    snapshot: Snapshot,
 }
 
 #[derive(Debug, Deserialize)]
@@ -814,7 +1123,20 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn session_listing(names: &[&str]) -> String {
+        serde_json::to_string(&json!({
+            "sessions": names.iter().map(|name| json!({
+                "name": name,
+                "running": true,
+                "socket_path": format!("/tmp/{name}.sock")
+            })).collect::<Vec<_>>()
+        }))
+        .unwrap()
+    }
+
+    #[cfg(unix)]
     fn snapshot_program(directory: &Path, name: &str, snapshot: &Value) -> std::path::PathBuf {
+        let sessions = session_listing(&["test"]);
         let snapshot = serde_json::to_string(snapshot).unwrap();
         let process_info = json!({
             "id": "test",
@@ -831,7 +1153,7 @@ mod tests {
             directory,
             name,
             &format!(
-                "if [ \"$1\" = api ]; then cat <<'JSON'\n{snapshot}\nJSON\nelif [ \"$1 $2\" = 'pane process-info' ]; then cat <<'JSON'\n{process_info}\nJSON\nelse printf '%s' '{{\"id\":\"test\",\"result\":{{\"type\":\"ok\"}}}}'; fi"
+                "if [ \"$1 $2 $3\" = 'session list --json' ]; then printf '%s' '{sessions}'; elif [ \"$1 $2 $3 $4\" = '--session test api snapshot' ]; then cat <<'JSON'\n{snapshot}\nJSON\nelif [ \"$1 $2 $3 $4\" = '--session test pane process-info' ]; then cat <<'JSON'\n{process_info}\nJSON\nelse printf '%s' '{{\"id\":\"test\",\"result\":{{\"type\":\"ok\"}}}}'; fi"
             ),
         )
     }
@@ -874,8 +1196,7 @@ mod tests {
                 "active",
             ),
         ] {
-            let json = serde_json::to_string(&value).unwrap();
-            let program = executable(fixture.path(), name, &format!("cat <<'JSON'\n{json}\nJSON"));
+            let program = snapshot_program(fixture.path(), name, &value);
             let result =
                 inspect_candidate_with_program(fixture.path(), Duration::from_secs(1), &program)
                     .unwrap();
@@ -902,7 +1223,14 @@ mod tests {
         let CandidateStatus::Clear(coordination) = result else {
             panic!("expected clear status");
         };
-        assert_eq!(coordination.workspaces, ["w1"]);
+        assert_eq!(
+            coordination
+                .workspaces
+                .iter()
+                .map(|workspace| (workspace.session.name.as_str(), workspace.id.as_str()))
+                .collect::<Vec<_>>(),
+            [("test", "w1")]
+        );
         assert_eq!(coordination.processes, BTreeSet::from([41, 42]));
     }
 
@@ -990,21 +1318,147 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn stale_workspace_is_deduplicated_and_retired_in_each_session() {
+        let fixture = tempdir().unwrap();
+        let git_common = fixture.path().join("repository/.git");
+        let checkout = fixture.path().join("repository/.worktrees/finished");
+        let trash = git_common.join("wt/trash/finished-1234");
+        fs::create_dir_all(&trash).unwrap();
+        let value = json!({
+            "id": "test",
+            "result": {
+                "type": "session_snapshot",
+                "snapshot": {
+                    "version": "0.9.0",
+                    "protocol": 22,
+                    "focused_pane_id": null,
+                    "panes": [{
+                        "pane_id": "w1:p1",
+                        "workspace_id": "w1",
+                        "focused": false,
+                        "cwd": trash,
+                        "foreground_cwd": trash,
+                        "agent": null,
+                        "agent_status": "unknown"
+                    }],
+                    "agents": [],
+                    "workspaces": [{
+                        "workspace_id": "w1",
+                        "worktree": {
+                            "checkout_path": checkout,
+                            "is_linked_worktree": true,
+                            "repo_key": git_common
+                        }
+                    }]
+                }
+            }
+        });
+        let sessions = session_listing(&["personal", "work"]);
+        let snapshot = serde_json::to_string(&value).unwrap();
+        let close_log = fixture.path().join("close.log");
+        let process_info = serde_json::to_string(&json!({
+            "id": "test",
+            "result": {
+                "type": "pane_process_info",
+                "process_info": {
+                    "pane_id": "w1:p1",
+                    "shell_pid": 41,
+                    "foreground_processes": []
+                }
+            }
+        }))
+        .unwrap();
+        let program = executable(
+            fixture.path(),
+            "multi-session",
+            &format!(
+                "if [ \"$1 $2 $3\" = 'session list --json' ]; then printf '%s' '{sessions}'; elif [ \"$3 $4\" = 'api snapshot' ]; then printf '%s' '{snapshot}'; elif [ \"$3 $4\" = 'pane process-info' ]; then printf '%s' '{process_info}'; else printf '%s\\n' \"$*\" >> '{}'; printf '%s' '{{\"id\":\"test\",\"result\":{{\"type\":\"workspace_closed\",\"workspace_id\":\"w1\"}}}}'; fi",
+                close_log.display()
+            ),
+        );
+
+        let status = inspect_stale_workspaces_with_program(
+            &git_common,
+            &BTreeSet::new(),
+            Duration::from_secs(1),
+            &program,
+        )
+        .unwrap();
+        let StaleWorkspaceStatus::Inspected(stale) = status else {
+            panic!("expected available Herdr status");
+        };
+        assert_eq!(stale.len(), 1);
+        let CandidateStatus::Clear(coordination) = &stale[0].status else {
+            panic!("expected clear status");
+        };
+        assert_eq!(coordination.workspace_count(), 2);
+
+        retire_candidate_with_program(coordination, Duration::from_secs(1), &program).unwrap();
+        let commands = fs::read_to_string(close_log).unwrap();
+        assert!(commands.contains("--session personal workspace close w1"));
+        assert!(commands.contains("--session work workspace close w1"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_change_during_retirement_fails_closed() {
+        let fixture = tempdir().unwrap();
+        let value = snapshot(fixture.path(), false, Some(("pi", "idle")));
+        let sessions = session_listing(&["test"]);
+        let no_sessions = session_listing(&[]);
+        let snapshot = serde_json::to_string(&value).unwrap();
+        let changed = fixture.path().join("changed");
+        let process_info = serde_json::to_string(&json!({
+            "id": "test",
+            "result": {
+                "type": "pane_process_info",
+                "process_info": {
+                    "pane_id": "w1:p1",
+                    "shell_pid": 41,
+                    "foreground_processes": []
+                }
+            }
+        }))
+        .unwrap();
+        let program = executable(
+            fixture.path(),
+            "changing-session",
+            &format!(
+                "if [ \"$1 $2 $3\" = 'session list --json' ]; then if [ -e '{changed}' ]; then printf '%s' '{no_sessions}'; else printf '%s' '{sessions}'; fi; elif [ \"$3 $4\" = 'api snapshot' ]; then printf '%s' '{snapshot}'; elif [ \"$3 $4\" = 'pane process-info' ]; then printf '%s' '{process_info}'; else touch '{changed}'; printf '%s' '{{\"id\":\"test\",\"result\":{{\"type\":\"workspace_closed\",\"workspace_id\":\"w1\"}}}}'; fi",
+                changed = changed.display()
+            ),
+        );
+        let CandidateStatus::Clear(coordination) =
+            inspect_candidate_with_program(fixture.path(), Duration::from_secs(1), &program)
+                .unwrap()
+        else {
+            panic!("expected clear status");
+        };
+
+        let error = retire_candidate_with_program(&coordination, Duration::from_secs(1), &program)
+            .unwrap_err();
+        assert!(error.to_string().contains("sessions changed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn malformed_and_incomplete_activity_fail_closed() {
         let fixture = tempdir().unwrap();
-        let malformed = executable(fixture.path(), "malformed", "printf '{'");
+        let sessions = session_listing(&["test"]);
+        let malformed = executable(
+            fixture.path(),
+            "malformed",
+            &format!(
+                "if [ \"$1 $2 $3\" = 'session list --json' ]; then printf '%s' '{sessions}'; else printf '{{'; fi"
+            ),
+        );
         assert!(matches!(
             inspect_candidate_with_program(fixture.path(), Duration::from_secs(1), &malformed),
             Err(InspectionError::MalformedJson(_))
         ));
 
         let value = snapshot(fixture.path(), false, Some(("pi", "unknown")));
-        let json = serde_json::to_string(&value).unwrap();
-        let incomplete = executable(
-            fixture.path(),
-            "incomplete",
-            &format!("cat <<'JSON'\n{json}\nJSON"),
-        );
+        let incomplete = snapshot_program(fixture.path(), "incomplete", &value);
         assert!(matches!(
             inspect_candidate_with_program(fixture.path(), Duration::from_secs(1), &incomplete),
             Err(InspectionError::IncompleteActivity(_))
@@ -1025,7 +1479,14 @@ mod tests {
         };
         retire_candidate_with_program(&coordination, Duration::from_secs(1), &success).unwrap();
 
-        let failure = executable(fixture.path(), "failure", "echo close-failed >&2; exit 1");
+        let sessions = session_listing(&["test"]);
+        let failure = executable(
+            fixture.path(),
+            "failure",
+            &format!(
+                "if [ \"$1 $2 $3\" = 'session list --json' ]; then printf '%s' '{sessions}'; else echo close-failed >&2; exit 1; fi"
+            ),
+        );
         let error = retire_candidate_with_program(&coordination, Duration::from_secs(1), &failure)
             .unwrap_err();
         assert!(error.to_string().contains("close-failed"));

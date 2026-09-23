@@ -57,15 +57,18 @@ tracked and untracked changes, and live-process working directories. Process
 inspection uses `lsof` on macOS and fails closed when it is unavailable. The
 `check_processes = false` setting is an explicit opt-out from that gate.
 
-Herdr coordination is automatic but optional. Lop inspects Herdr before treating
-an attributable idle terminal shell as unrelated worktree use. Focused panes;
-working, blocked, or unknown agents; mixed-path workspaces; and incomplete
+Herdr coordination is automatic but optional. Lop discovers every running local
+Herdr session, even when a scheduled scan starts outside a Herdr pane, before
+treating an attributable idle terminal shell as unrelated worktree use. Focused
+panes; working, blocked, or unknown agents; mixed-path workspaces; and incomplete
 activity remain protected. Preview mode never closes a workspace: it reports
 `herdr_coordination_pending` after confirming that every other process belongs to
 the verified idle/done Herdr panes.
 
-In apply mode, Lop closes only workspaces mapped exclusively to the candidate.
-It then inspects Herdr again and reruns the complete mutable Git and process
+In apply mode, Lop closes only workspaces mapped exclusively to the candidate,
+using each workspace's originating session. It fails closed if the observed session
+set or workspace topology changes during retirement. It then inspects Herdr again
+and reruns the complete mutable Git and process
 safety check immediately before Worktrunk. A close failure, activity or focus
 race, surviving process, or changed checkout refuses removal. Lop also
 reconciles idle, exclusive Herdr workspaces whose linked checkout is already
