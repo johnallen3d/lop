@@ -231,3 +231,67 @@ fn prune_requires_yes_to_apply() {
         assert_eq!(first["apply"], apply);
     }
 }
+
+#[test]
+fn local_exclusions_keep_repositories_out_of_scan_and_prune() {
+    let directory = tempdir().unwrap();
+    let config_home = directory.path().join("config");
+    let state_home = directory.path().join("state");
+    let repository = directory.path().join("sources/ignored");
+    fs::create_dir_all(config_home.join("lop")).unwrap();
+    fs::create_dir_all(&repository).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&repository)
+            .status()
+            .unwrap()
+            .success()
+    );
+    // A scan of this repository would fail if the exclusion were ignored.
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&repository)
+            .args(["remote", "add", "origin", "/nonexistent/lop-test-remote"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::write(
+        config_home.join("lop/config.toml"),
+        format!(
+            "roots = [{:?}]\n",
+            directory.path().join("sources").display().to_string(),
+        ),
+    )
+    .unwrap();
+    fs::write(
+        config_home.join("lop/exclusions.toml"),
+        format!("exclude_paths = [{:?}]\n", repository.display().to_string(),),
+    )
+    .unwrap();
+
+    for arguments in [&["scan"][..], &["prune", "--yes"][..]] {
+        let output = lop()
+            .args(arguments)
+            .env("HOME", directory.path())
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env("XDG_STATE_HOME", &state_home)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let records: Vec<Value> = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1]["repositories_scanned"], 0);
+        assert_eq!(records[1]["operational_failures"], 0);
+    }
+}

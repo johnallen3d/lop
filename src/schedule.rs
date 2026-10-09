@@ -11,11 +11,11 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{cli::ScheduleCommand, config::Config, discovery::discover};
+use crate::{cli::ScheduleCommand, config::Config, discovery::discover_with_exclusions};
 
 const LABEL: &str = "org.nixos.lop";
 const DEFAULT_INTERVAL_SECONDS: u64 = 1_800;
-const MINIMUM_INTERVAL_SECONDS: u64 = 300;
+const MINIMUM_INTERVAL_SECONDS: u64 = 60;
 const MAXIMUM_INTERVAL_SECONDS: u64 = 604_800;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 const LAUNCHCTL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -671,7 +671,8 @@ fn preflight_credentials(
     validate_runtime_paths(&app_paths)?;
     let config = Config::load(&app_paths.config_file)
         .map_err(|error| ScheduleError::Discovery(error.to_string()))?;
-    let discovery = discover(&config.roots, config.scan_depth);
+    let discovery =
+        discover_with_exclusions(&config.roots, config.scan_depth, &config.exclude_paths);
     if !discovery.issues.is_empty() {
         return Err(ScheduleError::Discovery(
             discovery
@@ -1401,15 +1402,33 @@ mod tests {
     }
 
     #[test]
+    fn one_minute_interval_is_valid_and_preserved_in_launch_agent() {
+        let (mut settings, environment, paths) = fixture();
+        settings.interval_seconds = 60;
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("schedule.toml");
+        fs::write(&path, settings.encode()).unwrap();
+        assert_eq!(load_settings(&path).unwrap(), settings);
+
+        let agent = generate_launch_agent(&settings, &environment, &paths);
+        let plist = directory.path().join("agent.plist");
+        fs::write(&plist, agent.contents).unwrap();
+        assert_eq!(
+            inspect_installed_schedule(&plist).unwrap().interval_seconds,
+            Some(60)
+        );
+    }
+
+    #[test]
     fn settings_reject_unknown_fields_and_tight_intervals() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("schedule.toml");
-        fs::write(&path, "mode = 'scan'\ninterval_seconds = 30\n").unwrap();
+        fs::write(&path, "mode = 'scan'\ninterval_seconds = 59\n").unwrap();
         assert!(
             load_settings(&path)
                 .unwrap_err()
                 .to_string()
-                .contains("between 300")
+                .contains("between 60")
         );
         fs::write(
             &path,

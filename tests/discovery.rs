@@ -151,3 +151,91 @@ fn reports_unsafe_root_canonicalization() {
         DiscoveryIssueKind::UnsafeCanonicalization
     );
 }
+
+#[test]
+fn exclusions_skip_subtrees_across_overlapping_roots_without_matching_siblings() {
+    use lop::discovery::discover_with_exclusions;
+
+    let fixture = tempdir().unwrap();
+    let root = fixture.path();
+    init_repository(&root.join("blocked/project"));
+    init_repository(&root.join("blocked-sibling"));
+    init_repository(&root.join("healthy"));
+    // This would produce an operational failure if discovery entered the subtree.
+    fs::create_dir_all(root.join("blocked/invalid/.git")).unwrap();
+    let result = discover_with_exclusions(
+        &[root.to_path_buf(), root.join("blocked/project")],
+        3,
+        &[root.join("blocked/../blocked")],
+    );
+    assert!(result.issues.is_empty(), "{:?}", result.issues);
+    let paths: Vec<_> = result
+        .repositories
+        .iter()
+        .map(|repo| repo.path.clone())
+        .collect();
+    assert_eq!(
+        paths,
+        [
+            fs::canonicalize(root.join("blocked-sibling")).unwrap(),
+            fs::canonicalize(root.join("healthy")).unwrap(),
+        ]
+    );
+}
+
+#[test]
+fn missing_exclusions_and_excluded_missing_roots_are_not_failures() {
+    use lop::discovery::discover_with_exclusions;
+
+    let fixture = tempdir().unwrap();
+    let root = fixture.path();
+    init_repository(&root.join("healthy"));
+    let missing = root.join("missing/subtree");
+    let result = discover_with_exclusions(&[root.to_path_buf(), missing.clone()], 2, &[missing]);
+    assert_eq!(result.repositories.len(), 1);
+    assert!(result.issues.is_empty(), "{:?}", result.issues);
+}
+
+#[cfg(unix)]
+#[test]
+fn exclusions_resolve_aliases_and_missing_paths_beneath_aliases() {
+    use lop::discovery::discover_with_exclusions;
+    use std::os::unix::fs::symlink;
+
+    let fixture = tempdir().unwrap();
+    let root = fixture.path().join("actual");
+    let alias = fixture.path().join("alias");
+    init_repository(&root.join("blocked"));
+    init_repository(&root.join("healthy"));
+    symlink(&root, &alias).unwrap();
+    let result = discover_with_exclusions(
+        &[alias.clone(), root.join("blocked")],
+        2,
+        &[alias.join("blocked"), alias.join("missing")],
+    );
+    assert_eq!(result.repositories.len(), 1);
+    assert_eq!(
+        result.repositories[0].path,
+        fs::canonicalize(root.join("healthy")).unwrap()
+    );
+    assert!(result.issues.is_empty(), "{:?}", result.issues);
+}
+
+#[cfg(unix)]
+#[test]
+fn unresolvable_exclusion_stops_discovery_fail_closed() {
+    use lop::discovery::discover_with_exclusions;
+    use std::os::unix::fs::symlink;
+
+    let fixture = tempdir().unwrap();
+    init_repository(&fixture.path().join("healthy"));
+    let cycle = fixture.path().join("cycle");
+    symlink(&cycle, &cycle).unwrap();
+    let result = discover_with_exclusions(&[fixture.path().to_path_buf()], 2, &[cycle]);
+    assert!(result.repositories.is_empty());
+    assert_eq!(result.issues.len(), 1);
+    assert_eq!(
+        result.issues[0].kind,
+        DiscoveryIssueKind::UnsafeCanonicalization
+    );
+}

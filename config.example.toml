@@ -2,6 +2,10 @@
 # worktrees live; it asks each repository through `git worktree list`.
 roots = ["~/dev/src"]
 
+# Optional directory subtrees to omit from cleanup discovery and schedule preflight.
+# Absolute and ~/ paths are supported; these are not glob patterns.
+exclude_paths = []
+
 # Maximum directory depth beneath each root when finding main repositories.
 scan_depth = 3
 

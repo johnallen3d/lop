@@ -9,6 +9,7 @@ use thiserror::Error;
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Config {
     pub roots: Vec<PathBuf>,
+    pub exclude_paths: Vec<PathBuf>,
     pub scan_depth: u32,
     pub fetch_timeout_seconds: u64,
     pub check_processes: bool,
@@ -18,12 +19,20 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     roots: Vec<String>,
+    #[serde(default)]
+    exclude_paths: Vec<String>,
     #[serde(default = "default_scan_depth")]
     scan_depth: u32,
     #[serde(default = "default_fetch_timeout_seconds")]
     fetch_timeout_seconds: u64,
     #[serde(default = "default_check_processes")]
     check_processes: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalExclusions {
+    exclude_paths: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -46,6 +55,8 @@ pub enum ConfigError {
         "invalid configuration: roots must contain at least one explicitly configured directory"
     )]
     NoRoots,
+    #[error("invalid exclusion {path:?}: {message}")]
+    InvalidExclusion { path: String, message: String },
     #[error("invalid configuration: root {root:?} is empty")]
     EmptyRoot { root: String },
     #[error("invalid configuration: root {root:?} must be absolute or start with '~/'")]
@@ -63,7 +74,9 @@ pub enum ConfigError {
 }
 
 impl Config {
-    /// Loads and validates Lop configuration from `path`.
+    /// Loads configuration and optional sibling `exclusions.toml`.
+    ///
+    /// Local exclusions are added to those in the main configuration.
     ///
     /// # Errors
     ///
@@ -81,10 +94,29 @@ impl Config {
                 });
             }
         };
-        let raw: RawConfig = toml::from_str(&contents).map_err(|source| ConfigError::Parse {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        let mut raw: RawConfig =
+            toml::from_str(&contents).map_err(|source| ConfigError::Parse {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let exclusions_path = path.with_file_name("exclusions.toml");
+        match fs::read_to_string(&exclusions_path) {
+            Ok(contents) => {
+                let local: LocalExclusions =
+                    toml::from_str(&contents).map_err(|source| ConfigError::Parse {
+                        path: exclusions_path.clone(),
+                        source,
+                    })?;
+                raw.exclude_paths.extend(local.exclude_paths);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(ConfigError::Read {
+                    path: exclusions_path,
+                    source,
+                });
+            }
+        }
         let home = std::env::var_os("HOME").map(PathBuf::from);
         Self::validate(raw, home.as_deref())
     }
@@ -105,8 +137,20 @@ impl Config {
             roots.push(expand_root(&root, home)?);
         }
 
+        let exclude_paths = raw
+            .exclude_paths
+            .iter()
+            .map(|path| {
+                expand_root(path, home).map_err(|error| ConfigError::InvalidExclusion {
+                    path: path.clone(),
+                    message: error.to_string(),
+                })
+            })
+            .collect::<Result<_, _>>()?;
+
         Ok(Self {
             roots,
+            exclude_paths,
             scan_depth: raw.scan_depth,
             fetch_timeout_seconds: raw.fetch_timeout_seconds,
             check_processes: raw.check_processes,
@@ -155,13 +199,19 @@ const fn default_check_processes() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
+
+    use tempfile::tempdir;
 
     use super::{Config, ConfigError, RawConfig};
 
     fn raw(roots: &[&str]) -> RawConfig {
         RawConfig {
             roots: roots.iter().map(ToString::to_string).collect(),
+            exclude_paths: Vec::new(),
             scan_depth: 3,
             fetch_timeout_seconds: 60,
             check_processes: true,
@@ -176,6 +226,26 @@ mod tests {
             config.roots,
             [Path::new("/home/me/dev"), Path::new("/opt/src")]
         );
+    }
+
+    #[test]
+    fn expands_exclusions_and_rejects_invalid_paths() {
+        let mut config = raw(&["/src"]);
+        config.exclude_paths = vec!["~/dev/private".to_owned(), "/src/ignored".to_owned()];
+        let validated = Config::validate(config, Some(Path::new("/home/me"))).unwrap();
+        assert_eq!(
+            validated.exclude_paths,
+            [Path::new("/home/me/dev/private"), Path::new("/src/ignored")]
+        );
+
+        for path in ["", "relative", "~other/src", "~/missing-home"] {
+            let mut config = raw(&["/src"]);
+            config.exclude_paths = vec![path.to_owned()];
+            assert!(matches!(
+                Config::validate(config, None),
+                Err(ConfigError::InvalidExclusion { .. })
+            ));
+        }
     }
 
     #[test]
@@ -227,8 +297,50 @@ mod tests {
     }
 
     #[test]
+    fn local_exclusions_extend_main_configuration_without_replacing_it() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let contents = "roots = ['/src']\nexclude_paths = ['/src/main-exclusion']\n";
+        fs::write(&path, contents).unwrap();
+        assert_eq!(Config::load(&path).unwrap().exclude_paths.len(), 1);
+        fs::write(
+            directory.path().join("exclusions.toml"),
+            "exclude_paths = ['/src/local-exclusion']\n",
+        )
+        .unwrap();
+        assert_eq!(
+            Config::load(&path).unwrap().exclude_paths,
+            [
+                Path::new("/src/main-exclusion"),
+                Path::new("/src/local-exclusion")
+            ]
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), contents);
+    }
+
+    #[test]
+    fn invalid_local_exclusions_fail_closed() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(&path, "roots = ['/src']\n").unwrap();
+        let exclusions = directory.path().join("exclusions.toml");
+        for contents in [
+            "exclude_paths = ['/src']\nsurprise = true\n",
+            "exclude_paths = ['relative']\n",
+            "not TOML",
+        ] {
+            fs::write(&exclusions, contents).unwrap();
+            assert!(Config::load(&path).is_err());
+        }
+        fs::remove_file(&exclusions).unwrap();
+        fs::create_dir(&exclusions).unwrap();
+        assert!(matches!(Config::load(&path), Err(ConfigError::Read { .. })));
+    }
+
+    #[test]
     fn defaults_optional_fields() {
         let raw: RawConfig = toml::from_str("roots = ['/src']").unwrap();
+        assert!(raw.exclude_paths.is_empty());
         assert_eq!(raw.scan_depth, 3);
         assert_eq!(raw.fetch_timeout_seconds, 60);
         assert!(raw.check_processes);

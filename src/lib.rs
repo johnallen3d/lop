@@ -24,7 +24,7 @@ use cleanup::{
 };
 use cli::{Cli, Command};
 use config::Config;
-use discovery::{DiscoveryIssueKind, discover};
+use discovery::{DiscoveryIssueKind, discover_with_exclusions};
 use herdr::{
     CandidateStatus, StaleWorkspaceStatus, inspect_candidate, inspect_stale_workspaces,
     retire_candidate,
@@ -97,7 +97,8 @@ pub fn run_with_paths(
         },
     )?;
 
-    let discovery = discover(&config.roots, config.scan_depth);
+    let discovery =
+        discover_with_exclusions(&config.roots, config.scan_depth, &config.exclude_paths);
     let mut summary = Summary::empty(command, apply);
     summary.repositories_scanned = discovery.repositories.len() as u64;
     summary.operational_failures = discovery.issues.len() as u64;

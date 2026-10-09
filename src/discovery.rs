@@ -40,6 +40,36 @@ pub struct Discovery {
 /// can report every operational problem.
 #[must_use]
 pub fn discover(roots: &[PathBuf], scan_depth: u32) -> Discovery {
+    discover_with_exclusions(roots, scan_depth, &[])
+}
+
+/// Finds repositories while skipping excluded directories and their descendants.
+///
+/// Exclusions apply across overlapping roots and canonical aliases. Missing
+/// exclusions are allowed; other resolution failures stop discovery fail-closed.
+#[must_use]
+pub fn discover_with_exclusions(
+    roots: &[PathBuf],
+    scan_depth: u32,
+    exclude_paths: &[PathBuf],
+) -> Discovery {
+    let mut canonical_exclusions = Vec::new();
+    for path in exclude_paths {
+        match canonicalize_exclusion(path) {
+            Ok(path) => canonical_exclusions.push(path),
+            Err(error) => {
+                return Discovery {
+                    repositories: Vec::new(),
+                    issues: vec![DiscoveryIssue {
+                        path: path.clone(),
+                        kind: DiscoveryIssueKind::UnsafeCanonicalization,
+                        message: format!("cannot resolve excluded directory: {error}"),
+                    }],
+                };
+            }
+        }
+    }
+
     let mut repositories = BTreeMap::<PathBuf, PathBuf>::new();
     let mut issues = Vec::new();
     let mut canonical_roots = HashSet::new();
@@ -48,16 +78,27 @@ pub fn discover(roots: &[PathBuf], scan_depth: u32) -> Discovery {
         let root = match fs::canonicalize(configured_root) {
             Ok(root) => root,
             Err(error) => {
+                if canonicalize_exclusion(configured_root)
+                    .is_ok_and(|path| is_excluded(&path, &canonical_exclusions))
+                {
+                    continue;
+                }
                 issues.push(canonicalization_issue(configured_root, &error, true));
                 continue;
             }
         };
 
-        if !canonical_roots.insert(root.clone()) {
+        if is_excluded(&root, &canonical_exclusions) || !canonical_roots.insert(root.clone()) {
             continue;
         }
 
-        walk_root(&root, scan_depth, &mut repositories, &mut issues);
+        walk_root(
+            &root,
+            scan_depth,
+            &canonical_exclusions,
+            &mut repositories,
+            &mut issues,
+        );
     }
 
     let mut repositories: Vec<_> = repositories
@@ -75,9 +116,35 @@ pub fn discover(roots: &[PathBuf], scan_depth: u32) -> Discovery {
     }
 }
 
+fn is_excluded(path: &Path, exclusions: &[PathBuf]) -> bool {
+    exclusions.iter().any(|excluded| path.starts_with(excluded))
+}
+
+fn canonicalize_exclusion(path: &Path) -> io::Result<PathBuf> {
+    match fs::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let Some(parent) = path.parent() else {
+                return Err(error);
+            };
+            let mut resolved = canonicalize_exclusion(parent)?;
+            match path.components().next_back() {
+                Some(std::path::Component::ParentDir) => {
+                    resolved.pop();
+                }
+                Some(std::path::Component::Normal(name)) => resolved.push(name),
+                _ => {}
+            }
+            Ok(resolved)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn walk_root(
     root: &Path,
     scan_depth: u32,
+    exclusions: &[PathBuf],
     repositories: &mut BTreeMap<PathBuf, PathBuf>,
     issues: &mut Vec<DiscoveryIssue>,
 ) {
@@ -85,6 +152,9 @@ fn walk_root(
     let mut visited = HashSet::new();
 
     while let Some((path, depth)) = pending.pop_front() {
+        if is_excluded(&path, exclusions) {
+            continue;
+        }
         let canonical_path = match fs::canonicalize(&path) {
             Ok(path) => path,
             Err(error) => {
@@ -93,6 +163,9 @@ fn walk_root(
             }
         };
 
+        if is_excluded(&canonical_path, exclusions) {
+            continue;
+        }
         if !canonical_path.starts_with(root) {
             issues.push(DiscoveryIssue {
                 path: canonical_path,

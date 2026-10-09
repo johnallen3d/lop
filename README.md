@@ -33,6 +33,7 @@ Lop requires at least one explicitly configured repository root. Copy
 
 ```toml
 roots = ["~/dev/src"]
+exclude_paths = ["~/dev/src/private"]
 scan_depth = 3
 fetch_timeout_seconds = 60
 check_processes = true
@@ -40,6 +41,28 @@ check_processes = true
 
 There is no implicit scan root. Root paths must be absolute or begin with `~/`.
 Unknown settings and invalid limits are rejected with an actionable error.
+
+`exclude_paths` is optional and accepts absolute or `~/` directory paths (not
+patterns). Excluded directories and their descendants are omitted from repository
+discovery for both cleanup and scheduler preflight, including overlapping scan
+roots and canonical aliases. Missing excluded directories are allowed. Exclusions
+filter repository discovery, not individual linked worktrees returned by Git for
+an otherwise included repository.
+
+For host-local exclusions without editing a managed main configuration, create
+`~/.config/lop/exclusions.toml` (honoring `XDG_CONFIG_HOME`):
+
+```toml
+exclude_paths = [
+  "~/dev/src/xcel/ai",
+  "~/dev/src/xcel/data-asset-workflows",
+  "~/dev/src/xcel/superset",
+]
+```
+
+This optional file adds to the main configuration's exclusions. Invalid local
+settings or exclusion-resolution failures fail closed rather than silently
+scanning directories intended to be excluded.
 
 Operational state is stored in `~/.local/state/lop/state.json`, honoring
 `XDG_STATE_HOME`. It records fetch/classification memory only and is never used
@@ -94,7 +117,7 @@ Installation starts in preview-only `scan` mode every 1,800 seconds. It creates
 `~/.config/lop/schedule.toml` (honoring `XDG_CONFIG_HOME`), and writes service
 output under `~/Library/Logs/org.nixos`. `schedule edit` opens a temporary copy
 with `VISUAL` or `EDITOR`; Lop accepts only `scan` or `prune` mode and intervals
-from 300 through 604,800 seconds before replacing and reloading the agent.
+from 60 through 604,800 seconds before replacing and reloading the agent.
 `prune` mode always invokes `lop prune --yes` explicitly.
 
 The generated LaunchAgent runs at load without `KeepAlive`, uses an explicit
